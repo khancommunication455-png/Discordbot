@@ -32,7 +32,8 @@ import { startAuctionSoldWatcher } from './services/auctionSoldWatcher.js';
 import { startAHChatBot } from './services/ahChatBot.js';
 import { startWebDashboard } from './web/server.js';
 import { Player } from 'discord-player';
-import { DefaultExtractors } from '@discord-player/extractor';
+import pkg from '@discord-player/extractor';
+const { DefaultExtractors } = pkg;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
