@@ -157,13 +157,16 @@ async function getOrCreateState(guild, voiceChannel) {
     selfDeaf: true,
   });
 
+  // Railway has strict UDP restrictions — waiting for Ready times out.
+  // Wait for Signalling (Discord gateway ACK) then sleep for UDP to settle.
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-    console.log('[Music] Voice connection ready');
-  } catch (err) {
-    connection.destroy();
-    throw new Error('Could not connect to voice channel — check bot permissions');
+    await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
+  } catch {
+    try { connection.destroy(); } catch {}
+    throw new Error('Could not connect to voice channel — check bot has Connect + Speak permissions');
   }
+  await new Promise(r => setTimeout(r, 2000));
+  console.log('[Music] Voice connection established');
 
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   connection.subscribe(player);

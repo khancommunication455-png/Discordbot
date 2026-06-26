@@ -181,13 +181,16 @@ export async function setupTTS(guild, voiceChannelId, textChannelId) {
     selfDeaf: false, selfMute: false,
   });
 
-  // Wait for connection to be ready (max 10s) instead of blind sleep
+  // Railway UDP is restrictive — entersState(Ready/Connecting) times out.
+  // Wait for Signalling (Discord gateway ACK only), then sleep for UDP to settle.
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+    await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
   } catch {
-    connection.destroy();
-    throw new Error('Could not connect to voice channel');
+    try { connection.destroy(); } catch {}
+    throw new Error('Could not connect to voice channel — check bot has Connect + Speak permissions');
   }
+  // Give Railway network time to complete UDP negotiation before playing audio
+  await new Promise(r => setTimeout(r, 2500));
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -325,7 +328,10 @@ export async function moveTTS(guild, newVcId) {
       channelId: newVcId, guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator, selfDeaf: false,
     });
-    await new Promise(r => setTimeout(r, 1000));
+    try {
+      await entersState(conn, VoiceConnectionStatus.Connecting, 15_000);
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
     try { s.connection.destroy(); } catch {}
     s.connection = conn; s.voiceChannelId = newVcId;
     conn.subscribe(s.player);
