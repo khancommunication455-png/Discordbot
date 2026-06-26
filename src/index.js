@@ -32,8 +32,6 @@ import { startAuctionSoldWatcher } from './services/auctionSoldWatcher.js';
 import { startAHChatBot } from './services/ahChatBot.js';
 import { startWebDashboard } from './web/server.js';
 import { Player } from 'discord-player';
-import pkg from '@discord-player/extractor';
-const { DefaultExtractors } = pkg;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -120,9 +118,17 @@ async function main() {
     }
   });
   
-  // FIXED: Replaced loadMulti with modern v6 loadDefault syntax 
-  await player.extractors.loadDefault((ext) => DefaultExtractors.includes(ext));
-  console.log('🎵 Music Player ready');
+  try {
+    if (typeof player.extractors?.loadDefault === 'function') {
+      await player.extractors.loadDefault();
+      console.log('🎵 Music Player ready');
+    } else {
+      console.warn('⚠️ discord-player extractor loader is unavailable in this runtime; continuing without built-in extractors');
+    }
+  } catch (err) {
+    console.warn(`⚠️ Failed to initialize discord-player extractors: ${err.message}`);
+    console.warn('Continuing startup without music extractors.');
+  }
 
   await loadCommands(path.join(__dirname, 'commands'));
   await loadEvents(path.join(__dirname, 'events'));
