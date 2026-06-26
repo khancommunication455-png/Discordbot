@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SkyBot Admin Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; overflow-x: hidden; }
+        .glass-panel { background: rgba(30, 41, 59, 0.6); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.05); }
+        .glass-input { background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(255, 255, 255, 0.1); color: #fff; }
+        .glass-input:focus { outline: none; border-color: #00D4AA; box-shadow: 0 0 0 2px rgba(0, 212, 170, 0.2); }
+        
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col relative">
+    <!-- Ambient glowing backgrounds -->
+    <div class="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-blue-600/20 blur-[150px] z-0 pointer-events-none"></div>
+    <div class="fixed bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-teal-500/20 blur-[150px] z-0 pointer-events-none"></div>
+
+    <!-- Navigation -->
+    <nav class="glass-panel sticky top-0 z-50 border-b border-white/10 shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center space-x-3">
+                    <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-500 to-teal-400 flex items-center justify-center shadow-lg shadow-blue-500/30">
+                        <svg class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                    </div>
+                    <span class="font-bold text-xl tracking-tight">SkyBot Admin</span>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2">
+                        <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" alt="Avatar" class="w-8 h-8 rounded-full border border-white/20">
+                        <span class="text-sm font-medium text-slate-300"><%= user.username %></span>
+                    </div>
+                    <a href="/api/auth/logout" class="text-sm px-4 py-2 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500 hover:text-white transition-colors duration-200">Logout</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="flex-1 relative z-10 p-6 sm:p-10 max-w-7xl mx-auto w-full">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- Statistics Sidebar -->
+            <div class="space-y-6">
+                <div class="glass-panel p-6 rounded-2xl shadow-xl">
+                    <h2 class="text-lg font-semibold mb-4 text-slate-200 border-b border-slate-700 pb-2">System Overview</h2>
+                    <div class="space-y-4">
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Total Servers</span>
+                            <span class="font-mono text-xl text-white"><%= client.guilds.cache.size %></span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Total Users</span>
+                            <span class="font-mono text-xl text-white"><%= client.users.cache.size %></span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Uptime</span>
+                            <span class="font-mono text-md text-teal-400"><%= Math.floor(client.uptime / 3600000) %>h <%= Math.floor((client.uptime % 3600000) / 60000) %>m</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Bot Latency</span>
+                            <span class="font-mono text-md text-yellow-400"><%= client.ws.ping %>ms</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel p-6 rounded-2xl shadow-xl">
+                    <h2 class="text-lg font-semibold mb-4 text-slate-200 border-b border-slate-700 pb-2">Carry Types</h2>
+                    <div class="space-y-2 max-h-60 overflow-y-auto pr-2">
+                        <% for (const [type, info] of Object.entries(carryTypes)) { %>
+                            <div class="flex items-center justify-between p-2 rounded-lg bg-slate-800/50 border border-slate-700/50">
+                                <div class="flex items-center space-x-2">
+                                    <span><%= info.emoji %></span>
+                                    <span class="text-sm font-medium"><%= info.label %></span>
+                                </div>
+                                <span class="text-xs text-slate-400 font-mono"><%= info.price %></span>
+                            </div>
+                        <% } %>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Configuration Form -->
+            <div class="lg:col-span-2 space-y-6">
+                <div class="glass-panel p-8 rounded-2xl shadow-xl">
+                    <div class="mb-8">
+                        <h2 class="text-2xl font-bold text-white mb-2">Guild Configuration</h2>
+                        <p class="text-slate-400 text-sm">Select a server you manage to configure its features.</p>
+                    </div>
+
+                    <form action="/dashboard/settings" method="POST" class="space-y-6">
+                        <!-- Server Selection -->
+                        <div>
+                            <label class="block text-sm font-medium text-slate-300 mb-2">Select Server</label>
+                            <select name="guildId" id="guildId" class="w-full glass-input rounded-xl px-4 py-3 appearance-none cursor-pointer" required onchange="loadGuildSettings(this.value)">
+                                <option value="" disabled selected>-- Choose a Server --</option>
+                                <% user.guilds.filter(g => g.permissions & 0x8).forEach(guild => { %>
+                                    <option value="<%= guild.id %>"><%= guild.name %></option>
+                                <% }) %>
+                            </select>
+                            <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-400 mt-8">
+                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-slate-700/50">
+                            <!-- TTS Channel -->
+                            <div>
+                                <label class="block text-sm font-medium text-slate-300 mb-2">TTS Text Channel ID</label>
+                                <input type="text" name="ttsChannel" id="ttsChannel" placeholder="e.g. 123456789012345678" class="w-full glass-input rounded-xl px-4 py-3 transition-all">
+                                <p class="text-xs text-slate-500 mt-2">Channel where users type text for the bot to speak.</p>
+                            </div>
+
+                            <!-- Mod Log Channel -->
+                            <div>
+                                <label class="block text-sm font-medium text-slate-300 mb-2">Mod Log Channel ID</label>
+                                <input type="text" name="logChannel" id="logChannel" placeholder="e.g. 123456789012345678" class="w-full glass-input rounded-xl px-4 py-3 transition-all">
+                                <p class="text-xs text-slate-500 mt-2">Channel for moderation logs (bans, kicks, warns).</p>
+                            </div>
+
+                            <!-- AH Flip Channel -->
+                            <div class="md:col-span-2">
+                                <label class="block text-sm font-medium text-slate-300 mb-2">AH Flipper Pings Channel ID</label>
+                                <input type="text" name="ahChannel" id="ahChannel" placeholder="e.g. 123456789012345678" class="w-full glass-input rounded-xl px-4 py-3 transition-all">
+                                <p class="text-xs text-slate-500 mt-2">Where the bot posts automated AH flip alerts (Premium feature).</p>
+                            </div>
+                        </div>
+
+                        <div class="pt-6">
+                            <button type="submit" class="w-full bg-gradient-to-r from-blue-600 to-teal-500 hover:from-blue-500 hover:to-teal-400 text-white font-bold py-3 px-6 rounded-xl shadow-lg shadow-blue-500/30 transform transition hover:-translate-y-0.5 active:translate-y-0">
+                                Save Configuration
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Client-side script to populate fields when guild is selected -->
+    <script>
+        // We pass the raw db data down to JS (be careful in production to only pass needed data)
+        const dbData = <%- JSON.stringify({ ttsChannels: db.ttsChannels || {}, loggingConfig: db.loggingConfig || {} }) %>;
+        const currentAhChannel = "<%- process.env.AH_FLIP_CHANNEL_ID || '' %>";
+
+        function loadGuildSettings(guildId) {
+            document.getElementById('ttsChannel').value = dbData.ttsChannels[guildId] || '';
+            document.getElementById('logChannel').value = dbData.loggingConfig[guildId] || '';
+            document.getElementById('ahChannel').value = currentAhChannel;
+        }
+    </script>
+</body>
+</html>

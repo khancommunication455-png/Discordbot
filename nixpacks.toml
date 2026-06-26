@@ -1,0 +1,14 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python313"]
+
+[variables]
+PATH = "/app/venv/bin:$PATH"
+
+[phases.install]
+cmds = [
+  "python3 -m venv /app/venv && /app/venv/bin/pip install edge-tts yt-dlp -U -q",
+  "npm install"
+]
+
+[start]
+cmd = "node src/index.js"
