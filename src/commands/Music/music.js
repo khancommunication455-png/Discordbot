@@ -51,6 +51,7 @@ export default {
       const query = interaction.options.getString('query');
       
       try {
+        // FIXED: Added fallback search engine configuration so play-dl can index text keywords smoothly
         const { track } = await player.play(voiceChannel, query, {
           nodeOptions: {
             metadata: interaction,
@@ -59,7 +60,8 @@ export default {
             leaveOnEmptyCooldown: 300000,
             leaveOnEnd: true,
             leaveOnEndCooldown: 300000,
-          }
+          },
+          searchEngine: 'youtube'
         });
 
         await interaction.editReply({

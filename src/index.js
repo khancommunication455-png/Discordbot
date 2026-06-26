@@ -117,6 +117,14 @@ async function main() {
       highWaterMark: 1 << 25
     }
   });
+
+  // Global voice events handling to prevent unhandled promise rejections on Railway
+  player.events.on('error', (queue, error) => {
+    console.error(`[Player Error] Queue ${queue.guild.id} ran into an error:`, error.message);
+  });
+  player.events.on('playerError', (queue, error) => {
+    console.error(`[Player Connection Error] Connection issue in queue ${queue.guild.id}:`, error.message);
+  });
   
   try {
     if (typeof player.extractors?.loadDefault === 'function') {
