@@ -4,107 +4,116 @@ import {
   AudioPlayerStatus, VoiceConnectionStatus, StreamType, NoSubscriberBehavior,
   entersState,
 } from '@discordjs/voice';
-import { spawn, execSync, execFileSync } from 'child_process';
-import { existsSync } from 'fs';
+import ytdl from '@distube/ytdl-core';
+import { existsSync, execSync } from 'fs';
+import { spawn } from 'child_process';
 import { C } from '../../utils/embeds.js';
 
 const FOOTER = { text: 'TITAN Jr. Music' };
 
-// ── Find yt-dlp ──────────────────────────────────────────────────────────────
-function findYtDlp() {
-  for (const p of ['/root/.nix-profile/bin/yt-dlp', '/app/venv/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp']) {
-    try { execSync(`${p} --version`, { stdio: 'pipe' }); console.log('[Music] yt-dlp found at:', p); return p; } catch {}
-  }
-  console.error('[Music] yt-dlp not found!');
-  return 'yt-dlp';
-}
-
 // ── Find ffmpeg ───────────────────────────────────────────────────────────────
 function findFFmpeg() {
-  for (const p of [process.env.FFMPEG_PATH, '/root/.nix-profile/bin/ffmpeg', '/usr/bin/ffmpeg', 'ffmpeg']) {
+  for (const p of [
+    process.env.FFMPEG_PATH,
+    '/root/.nix-profile/bin/ffmpeg',
+    '/usr/bin/ffmpeg',
+    'ffmpeg',
+  ]) {
     if (!p) continue;
-    if (p === 'ffmpeg' || existsSync(p)) return p;
+    try {
+      if (p === 'ffmpeg') { execSync('ffmpeg -version', { stdio: 'pipe' }); return p; }
+      if (existsSync(p)) return p;
+    } catch {}
   }
   return 'ffmpeg';
 }
 
-const YTDLP = findYtDlp();
 const FFMPEG = findFFmpeg();
 
-// Per-guild music state
-const musicState = new Map();
-
-async function resolveTrack(query) {
+// ── Search YouTube ────────────────────────────────────────────────────────────
+async function searchYouTube(query) {
+  // Use ytdl-core's search via undocumented but stable YouTube search endpoint
   const isUrl = /^https?:\/\//.test(query);
-  // No -f flag during info extraction — format selection only applies at download time
-  const args = [
-    '--dump-json',
-    '--no-playlist',
-    '--no-warnings',
-    '--default-search', 'ytsearch',
-    isUrl ? query : `ytsearch1:${query}`,
-  ];
-  return new Promise((resolve, reject) => {
-    let out = '';
-    let errOut = '';
-    const proc = spawn(YTDLP, args);
-    proc.stdout.on('data', d => { out += d; });
-    proc.stderr.on('data', d => { errOut += d; });
-    proc.on('close', code => {
-      try {
-        const lines = out.trim().split('\n').filter(l => l.startsWith('{'));
-        if (!lines.length) {
-          console.error('[Music] yt-dlp no JSON output. stderr:', errOut.slice(0, 300));
-          return reject(new Error('Could not find that track'));
-        }
-        const info = JSON.parse(lines[0]);
-        const dur = info.duration || 0;
-        resolve({
-          title:     info.title || query,
-          url:       info.webpage_url || info.url || query,
-          duration:  info.duration_string || `${Math.floor(dur/60)}:${String(dur%60).padStart(2,'0')}`,
-          thumbnail: info.thumbnail || null,
-          author:    info.uploader || info.channel || 'Unknown',
-        });
-      } catch (e) {
-        console.error('[Music] yt-dlp parse error:', e.message, '| stderr:', errOut.slice(0, 300));
-        reject(new Error('Could not find that track'));
-      }
-    });
-    proc.on('error', e => {
-      console.error('[Music] yt-dlp spawn error:', e.message);
-      reject(new Error(`yt-dlp not found: ${e.message}`));
-    });
-  });
+  if (isUrl) {
+    const info = await ytdl.getInfo(query);
+    const v = info.videoDetails;
+    const dur = parseInt(v.lengthSeconds) || 0;
+    return {
+      title:     v.title,
+      url:       v.video_url,
+      duration:  `${Math.floor(dur/60)}:${String(dur%60).padStart(2,'0')}`,
+      thumbnail: v.thumbnails?.slice(-1)[0]?.url || null,
+      author:    v.author?.name || 'Unknown',
+      info,
+    };
+  }
+
+  // Search using YouTube's internal suggestion API
+  const res = await fetch(
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%3D%3D`,
+    { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' } }
+  );
+  const html = await res.text();
+  const match = html.match(/var ytInitialData = ({.+?});<\/script>/s);
+  if (!match) throw new Error('No search results found');
+  const data = JSON.parse(match[1]);
+  const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
+    ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents;
+  const video = contents?.find(c => c.videoRenderer)?.videoRenderer;
+  if (!video) throw new Error('No video found for that query');
+
+  const videoId = video.videoId;
+  const title = video.title?.runs?.[0]?.text || query;
+  const durText = video.lengthText?.simpleText || '0:00';
+  const thumb = video.thumbnail?.thumbnails?.slice(-1)[0]?.url || null;
+  const author = video.ownerText?.runs?.[0]?.text || 'Unknown';
+
+  return {
+    title,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    duration: durText,
+    thumbnail: thumb,
+    author,
+    info: null, // will fetch when streaming
+  };
 }
 
-function createStream(url) {
-  const dl = spawn(YTDLP, [
-    '-f', 'bestaudio/best',
-    '-o', '-',
-    '--no-playlist',
-    '--no-warnings',
-    '--no-part',
-    url,
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+// ── Create audio stream ───────────────────────────────────────────────────────
+async function createAudioStream(track) {
+  // Get fresh info if we don't have it (search result case)
+  let info = track.info;
+  if (!info) {
+    info = await ytdl.getInfo(track.url);
+  }
 
+  // Get best audio format
+  const format = ytdl.chooseFormat(info.formats, {
+    quality: 'highestaudio',
+    filter: 'audioonly',
+  });
+
+  // Stream via ffmpeg: mp4/webm audio → OggOpus
   const ff = spawn(FFMPEG, [
-    '-i', 'pipe:0',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i', format.url,
+    '-vn',
     '-c:a', 'libopus',
     '-b:a', '96k',
     '-vbr', 'on',
     '-f', 'ogg',
     'pipe:1',
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  dl.stdout.pipe(ff.stdin);
-  dl.stderr.on('data', d => { const s = d.toString(); if (!s.includes('fragment')) console.error('[Music][yt-dlp]', s.trim().slice(0,200)); });
   ff.stderr.on('data', () => {});
-  dl.on('error', e => { console.error('[Music][yt-dlp spawn]', e.message); try { ff.kill(); } catch {} });
-  ff.on('error', e => { console.error('[Music][ffmpeg spawn]', e.message); });
+  ff.on('error', e => console.error('[Music][ffmpeg]', e.message));
 
   return ff.stdout;
 }
+
+// ── Per-guild state ───────────────────────────────────────────────────────────
+const musicState = new Map();
 
 async function playNext(guildId) {
   const state = musicState.get(guildId);
@@ -115,12 +124,14 @@ async function playNext(guildId) {
   const track = state.queue.shift();
   state.current = track;
   try {
-    const resource = createAudioResource(createStream(track.url), {
+    const audioStream = await createAudioStream(track);
+    const resource = createAudioResource(audioStream, {
       inputType: StreamType.OggOpus,
       inlineVolume: true,
     });
     resource.volume?.setVolume(state.volume ?? 0.8);
     state.player.play(resource);
+    console.log(`[Music] Playing: ${track.title}`);
   } catch (err) {
     console.error('[Music] playNext error:', err.message);
     state.current = null;
@@ -147,10 +158,11 @@ async function getOrCreateState(guild, voiceChannel) {
   });
 
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-  } catch {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    console.log('[Music] Voice connection ready');
+  } catch (err) {
     connection.destroy();
-    throw new Error('Could not connect to voice channel — please try again');
+    throw new Error('Could not connect to voice channel — check bot permissions');
   }
 
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
@@ -162,9 +174,7 @@ async function getOrCreateState(guild, voiceChannel) {
   player.on(AudioPlayerStatus.Idle, () => {
     if (!musicState.has(guild.id)) return;
     const s = musicState.get(guild.id);
-    if (s.loop && s.current) {
-      s.queue.unshift(s.current);
-    }
+    if (s.loop && s.current) s.queue.unshift(s.current);
     setTimeout(() => playNext(guild.id), 500);
   });
   player.on('error', err => {
@@ -188,10 +198,11 @@ async function getOrCreateState(guild, voiceChannel) {
   return state;
 }
 
+// ── Command ───────────────────────────────────────────────────────────────────
 export default {
   data: new SlashCommandBuilder()
     .setName('music')
-    .setDescription('Music Player powered by yt-dlp')
+    .setDescription('Music Player — YouTube')
     .addSubcommand(s => s
       .setName('play')
       .setDescription('Play a song from YouTube')
@@ -206,7 +217,7 @@ export default {
     .addSubcommand(s => s
       .setName('volume')
       .setDescription('Set volume (0–100)')
-      .addIntegerOption(o => o.setName('level').setDescription('Volume level').setRequired(true).setMinValue(0).setMaxValue(100))
+      .addIntegerOption(o => o.setName('level').setDescription('Volume').setRequired(true).setMinValue(0).setMaxValue(100))
     )
     .addSubcommand(s => s.setName('nowplaying').setDescription('Show currently playing track')),
 
@@ -229,7 +240,7 @@ export default {
       await interaction.deferReply();
       const query = interaction.options.getString('query');
       try {
-        const track = await resolveTrack(query);
+        const track = await searchYouTube(query);
         const s = await getOrCreateState(interaction.guild, voiceChannel);
         s.queue.push(track);
         const wasIdle = s.current === null;
@@ -248,8 +259,11 @@ export default {
           .setFooter(FOOTER).setTimestamp()
         ]});
       } catch (err) {
-        console.error('[Music Play Error]', err);
-        await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('Error').setDescription(err.message).setFooter(FOOTER).setTimestamp()] });
+        console.error('[Music Play Error]', err.message);
+        await interaction.editReply({ embeds: [new EmbedBuilder()
+          .setColor(C.error).setTitle('Error').setDescription(err.message)
+          .setFooter(FOOTER).setTimestamp()
+        ]});
       }
     }
 
@@ -274,11 +288,9 @@ export default {
       if (!state?.current) return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Queue Empty').setDescription('Nothing is playing.').setFooter(FOOTER).setTimestamp());
       const list = state.queue.slice(0, 10).map((t, i) => `**${i+1}.** [${t.title}](${t.url})`).join('\n');
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954')
-        .setTitle('Music Queue')
+        .setColor(C.music ?? '#1DB954').setTitle('Music Queue')
         .setDescription(`**Now Playing:** [${state.current.title}](${state.current.url})\n\n${list || 'No more tracks.'}`)
-        .setFooter({ text: `${state.queue.length} track(s) in queue · Loop: ${state.loop ? 'ON' : 'OFF'}` })
-        .setTimestamp());
+        .setFooter({ text: `${state.queue.length} track(s) · Loop: ${state.loop ? 'ON' : 'OFF'}` }).setTimestamp());
     }
 
     else if (sub === 'pause') {
@@ -309,8 +321,7 @@ export default {
       if (!state?.current) return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp());
       const t = state.current;
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954')
-        .setTitle('Now Playing')
+        .setColor(C.music ?? '#1DB954').setTitle('Now Playing')
         .setDescription(`**[${t.title}](${t.url})**`)
         .setThumbnail(t.thumbnail)
         .addFields(
