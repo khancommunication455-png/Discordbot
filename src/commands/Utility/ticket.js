@@ -59,7 +59,7 @@ export default {
         .setEmoji('🎫');
 
       await channel.send({ embeds: [embed], components: [new ActionRowBuilder().addComponents(btn)] });
-      await interaction.reply({ embeds: [successEmbed('Panel Sent', `Ticket panel sent to ${channel}.`)], ephemeral: true });
+      await interaction.reply({ embeds: [successEmbed('Panel Sent', `Ticket panel sent to ${channel}.`)], flags: [64] });
     }
 
     // ── CLOSE ─────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ export default {
       const db = getDb();
       const isTicket = interaction.channel.name.startsWith('ticket-');
       if (!isTicket) {
-        return interaction.reply({ embeds: [errorEmbed('Not a Ticket', 'Run this in a ticket channel.')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('Not a Ticket', 'Run this in a ticket channel.')], flags: [64] });
       }
 
       const closeEmbed = new EmbedBuilder()

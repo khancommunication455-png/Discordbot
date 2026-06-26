@@ -87,7 +87,7 @@ export default {
     else if (sub === 'fight') {
       const opponent = interaction.options.getUser('user');
       if (opponent.id === interaction.user.id) {
-        return interaction.reply({ embeds: [errorEmbed('Error', "You can't fight yourself!")], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('Error', "You can't fight yourself!")], flags: [64] });
       }
       const win = Math.random() > 0.5;
       const winner = win ? interaction.user : opponent;

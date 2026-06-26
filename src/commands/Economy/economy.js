@@ -106,7 +106,7 @@ export default {
       if (cd > 0) {
         return interaction.reply({
           embeds: [e(C.error, 'Already Claimed', `You can claim your daily reward again in **${formatDuration(cd)}**.`)],
-          ephemeral: true,
+          flags: [64],
         });
       }
       const db       = getDb();
@@ -138,7 +138,7 @@ export default {
     if (sub === 'work') {
       const d  = getEconomy(guildId, uid);
       const cd = WORK_CD - (now - (d.lastWork ?? 0));
-      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'On Cooldown', `You can work again in **${formatDuration(cd)}**.`)], ephemeral: true });
+      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'On Cooldown', `You can work again in **${formatDuration(cd)}**.`)], flags: [64] });
       const earned    = Math.floor(Math.random() * 601) + 200;
       const job       = WORK_MSGS[Math.floor(Math.random() * WORK_MSGS.length)];
       d.wallet       += earned;
@@ -155,7 +155,7 @@ export default {
     if (sub === 'crime') {
       const d  = getEconomy(guildId, uid);
       const cd = CRIME_CD - (now - (d.lastCrime ?? 0));
-      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'Laying Low', `You need to lay low for **${formatDuration(cd)}** before your next crime.`)], ephemeral: true });
+      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'Laying Low', `You need to lay low for **${formatDuration(cd)}** before your next crime.`)], flags: [64] });
       const success    = Math.random() > 0.4;
       const crime      = CRIME_MSGS[Math.floor(Math.random() * CRIME_MSGS.length)];
       d.lastCrime      = now;
@@ -177,7 +177,7 @@ export default {
       const d      = getEconomy(guildId, uid);
       const space  = BANK_CAP - (d.bank ?? 0);
       const amount = Math.min(interaction.options.getInteger('amount'), d.wallet ?? 0, space);
-      if (amount <= 0) return interaction.reply({ embeds: [e(C.error, 'Cannot Deposit', 'Your bank is full or wallet is empty.')], ephemeral: true });
+      if (amount <= 0) return interaction.reply({ embeds: [e(C.error, 'Cannot Deposit', 'Your bank is full or wallet is empty.')], flags: [64] });
       d.wallet -= amount; d.bank = (d.bank ?? 0) + amount;
       await saveEconomy(guildId, uid, d);
       return interaction.reply({ embeds: [e(C.success, 'Deposited', `**${formatMoney(amount)}** moved to bank.\n🏦 Bank: **${formatMoney(d.bank)}** / ${formatMoney(BANK_CAP)}`)] });
@@ -187,7 +187,7 @@ export default {
     if (sub === 'withdraw') {
       const d      = getEconomy(guildId, uid);
       const amount = Math.min(interaction.options.getInteger('amount'), d.bank ?? 0);
-      if (amount <= 0) return interaction.reply({ embeds: [e(C.error, 'Cannot Withdraw', 'Your bank balance is insufficient.')], ephemeral: true });
+      if (amount <= 0) return interaction.reply({ embeds: [e(C.error, 'Cannot Withdraw', 'Your bank balance is insufficient.')], flags: [64] });
       d.bank -= amount; d.wallet = (d.wallet ?? 0) + amount;
       await saveEconomy(guildId, uid, d);
       return interaction.reply({ embeds: [e(C.success, 'Withdrawn', `**${formatMoney(amount)}** moved to wallet.\n💵 Wallet: **${formatMoney(d.wallet)}**`)] });
@@ -197,9 +197,9 @@ export default {
     if (sub === 'pay') {
       const target = interaction.options.getUser('user');
       const amount = interaction.options.getInteger('amount');
-      if (target.id === uid) return interaction.reply({ embeds: [e(C.error, 'Invalid', 'You cannot pay yourself.')], ephemeral: true });
+      if (target.id === uid) return interaction.reply({ embeds: [e(C.error, 'Invalid', 'You cannot pay yourself.')], flags: [64] });
       const sender   = getEconomy(guildId, uid);
-      if ((sender.wallet ?? 0) < amount) return interaction.reply({ embeds: [e(C.error, 'Insufficient Funds', `You only have **${formatMoney(sender.wallet)}** in your wallet.`)], ephemeral: true });
+      if ((sender.wallet ?? 0) < amount) return interaction.reply({ embeds: [e(C.error, 'Insufficient Funds', `You only have **${formatMoney(sender.wallet)}** in your wallet.`)], flags: [64] });
       const receiver = getEconomy(guildId, target.id);
       sender.wallet  -= amount; receiver.wallet = (receiver.wallet ?? 0) + amount;
       await saveEconomy(guildId, uid, sender);
@@ -210,10 +210,10 @@ export default {
     // ── ROB ───────────────────────────────────────────────────────────
     if (sub === 'rob') {
       const target = interaction.options.getUser('user');
-      if (target.id === uid) return interaction.reply({ embeds: [e(C.error, 'Invalid', 'You cannot rob yourself.')], ephemeral: true });
+      if (target.id === uid) return interaction.reply({ embeds: [e(C.error, 'Invalid', 'You cannot rob yourself.')], flags: [64] });
       const robber = getEconomy(guildId, uid);
       const cd     = ROB_CD - (now - (robber.lastRob ?? 0));
-      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'Wanted', `Wait **${formatDuration(cd)}** before attempting another robbery.`)], ephemeral: true });
+      if (cd > 0) return interaction.reply({ embeds: [e(C.error, 'Wanted', `Wait **${formatDuration(cd)}** before attempting another robbery.`)], flags: [64] });
       const victim  = getEconomy(guildId, target.id);
       robber.lastRob = now;
       if ((victim.wallet ?? 0) < 100) {
@@ -238,7 +238,7 @@ export default {
     if (sub === 'gamble') {
       const d      = getEconomy(guildId, uid);
       const amount = Math.min(interaction.options.getInteger('amount'), d.wallet ?? 0);
-      if (amount < 10) return interaction.reply({ embeds: [e(C.error, 'Too Low', 'You need at least **$10** in your wallet to gamble.')], ephemeral: true });
+      if (amount < 10) return interaction.reply({ embeds: [e(C.error, 'Too Low', 'You need at least **$10** in your wallet to gamble.')], flags: [64] });
       const win    = Math.random() > 0.45;
       d.wallet     = (d.wallet ?? 0) + (win ? amount : -amount);
       await saveEconomy(guildId, uid, d);

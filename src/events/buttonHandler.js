@@ -48,9 +48,9 @@ export default {
       const allTypes = { ...CARRY_TYPES, ...(cfg?.customCarries ?? {}) };
       const info     = allTypes[type];
 
-      if (!info) return interaction.reply({ content: 'Unknown carry type.', ephemeral: true });
+      if (!info) return interaction.reply({ content: 'Unknown carry type.', flags: [64] });
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
 
       const providers = db.data.carryProviders ?? {};
       const eligible  = Object.entries(providers)
@@ -143,7 +143,7 @@ export default {
       if (!myTypes.length) {
         return interaction.reply({
           embeds: [new EmbedBuilder().setColor(C.error).setTitle('Not a Provider').setDescription('Register as a carry provider first with `/carry register`.').setFooter(FOOTER).setTimestamp()],
-          ephemeral: true,
+          flags: [64],
         });
       }
 
@@ -170,7 +170,7 @@ export default {
 
     // ── Ticket Create ─────────────────────────────────────────────────
     if (customId === 'ticket_create') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const db = getDb();
 
       const existing = interaction.guild.channels.cache.find(

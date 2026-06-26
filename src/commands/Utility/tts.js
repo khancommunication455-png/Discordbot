@@ -46,7 +46,7 @@ export default {
     ),
 
   async execute(interaction, client) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: [64] });
 
     const sub     = interaction.options.getSubcommand();
     const db      = getDb();

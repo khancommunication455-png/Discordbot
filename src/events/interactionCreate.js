@@ -10,7 +10,7 @@ export default {
     if (!command) {
       return interaction.reply({
         embeds: [errorEmbed('Unknown Command', `\`/${interaction.commandName}\` does not exist.`)],
-        ephemeral: true,
+        flags: [64],
       }).catch(() => {});
     }
 
@@ -27,7 +27,7 @@ export default {
         const left = ((exp - now) / 1000).toFixed(1);
         return interaction.reply({
           embeds: [errorEmbed('Cooldown', `Wait **${left}s** before using this again.`)],
-          ephemeral: true,
+          flags: [64],
         }).catch(() => {});
       }
     }
@@ -51,7 +51,7 @@ export default {
       console.error(`[Command Error] /${interaction.commandName}:`, err);
       const errPayload = {
         embeds: [errorEmbed('Error', err.message?.slice(0, 200) ?? 'Something went wrong.')],
-        ephemeral: true,
+        flags: [64],
       };
       try {
         if (interaction.replied || interaction.deferred) {

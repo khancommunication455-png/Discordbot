@@ -38,7 +38,7 @@ export default {
 
       // Verify message exists
       const msg = await interaction.channel.messages.fetch(msgId).catch(() => null);
-      if (!msg) return interaction.reply({ embeds: [errorEmbed('Not Found', 'Message not found in this channel.')], ephemeral: true });
+      if (!msg) return interaction.reply({ embeds: [errorEmbed('Not Found', 'Message not found in this channel.')], flags: [64] });
 
       if (!db.data.reactionRoles[guildId][msgId]) db.data.reactionRoles[guildId][msgId] = {};
       db.data.reactionRoles[guildId][msgId][emoji] = role.id;

@@ -91,7 +91,7 @@ export default {
       const channel  = interaction.options.getChannel('channel') ?? interaction.channel;
       const durMs    = parseDuration(durStr);
 
-      if (!durMs || durMs < 10000) return interaction.reply({ embeds: [errorEmbed('Invalid Duration', 'Use format like `10m`, `1h`, `2d`')], ephemeral: true });
+      if (!durMs || durMs < 10000) return interaction.reply({ embeds: [errorEmbed('Invalid Duration', 'Use format like `10m`, `1h`, `2d`')], flags: [64] });
 
       const endsAt = Date.now() + durMs;
 
@@ -109,7 +109,7 @@ export default {
         )
         .setTimestamp(new Date(endsAt));
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const msg = await channel.send({ embeds: [embed], components: [new ActionRowBuilder().addComponents(enterBtn)] });
       await msg.react('🎉');
 
@@ -131,14 +131,14 @@ export default {
       const timer = giveawayTimers.get(`${guildId}_${msgId}`);
       if (timer) clearTimeout(timer);
       await endGiveaway(client, guildId, msgId);
-      return interaction.reply({ embeds: [successEmbed('Giveaway Ended', 'The giveaway has been ended early.')], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Giveaway Ended', 'The giveaway has been ended early.')], flags: [64] });
     }
 
     // ── REROLL ────────────────────────────────────────────────────────────
     if (sub === 'reroll') {
       const msgId = interaction.options.getString('message_id');
       const gw    = db.data.giveaways[guildId]?.[msgId];
-      if (!gw?.ended) return interaction.reply({ embeds: [errorEmbed('Not Ended', 'This giveaway has not ended yet.')], ephemeral: true });
+      if (!gw?.ended) return interaction.reply({ embeds: [errorEmbed('Not Ended', 'This giveaway has not ended yet.')], flags: [64] });
 
       try {
         const channel = await client.channels.fetch(gw.channelId);
@@ -167,7 +167,7 @@ export default {
           await msg.delete();
         }
       } catch {}
-      return interaction.reply({ embeds: [successEmbed('Deleted', 'Giveaway deleted.')], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Deleted', 'Giveaway deleted.')], flags: [64] });
     }
   },
 };

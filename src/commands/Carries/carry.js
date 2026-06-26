@@ -201,7 +201,7 @@ async function createCarryThread(interaction, type, client) {
       .setDescription(`Your carry thread has been created: ${thread}\nProviders have been notified.`)
       .setFooter(FOOTER).setTimestamp()
     ],
-    ephemeral: true,
+    flags: [64],
   });
 }
 
@@ -280,7 +280,7 @@ export default {
 
     // ── SETUP ─────────────────────────────────────────────────────────
     if (sub === 'setup') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const channel = interaction.options.getChannel('channel');
       cfg.carryChannelId = channel.id;
       await saveDb();
@@ -304,7 +304,7 @@ export default {
 
     // ── PANEL (refresh) ───────────────────────────────────────────────
     if (sub === 'panel') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const channelId = cfg.carryChannelId;
       if (!channelId) {
         return interaction.editReply({
@@ -334,7 +334,7 @@ export default {
 
     // ── SETPRICE ──────────────────────────────────────────────────────
     if (sub === 'setprice') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const type  = interaction.options.getString('type');
       const price = interaction.options.getString('price');
       cfg.carryPrices[type] = price;
@@ -359,7 +359,7 @@ export default {
 
     // ── ADDTYPE ───────────────────────────────────────────────────────
     if (sub === 'addtype') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const id       = interaction.options.getString('id').toLowerCase().replace(/\s/g, '_');
       const label    = interaction.options.getString('label');
       const price    = interaction.options.getString('price');
@@ -389,7 +389,7 @@ export default {
 
     // ── REMOVETYPE ────────────────────────────────────────────────────
     if (sub === 'removetype') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: [64] });
       const id = interaction.options.getString('id');
       delete cfg.customCarries[id];
       delete cfg.carryPrices[id];
@@ -427,7 +427,7 @@ export default {
           .setFooter(FOOTER).setTimestamp()
         ],
         components: [new ActionRowBuilder().addComponents(select)],
-        ephemeral: true,
+        flags: [64],
       });
     }
 
@@ -437,7 +437,7 @@ export default {
       await saveDb();
       return interaction.reply({
         embeds: [new EmbedBuilder().setColor(C.success).setTitle('Unregistered').setDescription('You have been removed from the carry provider list.').setFooter(FOOTER).setTimestamp()],
-        ephemeral: true,
+        flags: [64],
       });
     }
 

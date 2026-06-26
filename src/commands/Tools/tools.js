@@ -113,7 +113,7 @@ export default {
           .setFooter({ text: 'Keep this safe — do not share it!' })
           .setTimestamp()
         ],
-        ephemeral: true,
+        flags: [64],
       });
     }
 

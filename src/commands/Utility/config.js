@@ -102,7 +102,7 @@ export default {
     ),
 
   async execute(interaction, client) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: [64] });
 
     const group   = interaction.options.getSubcommandGroup();
     const sub     = interaction.options.getSubcommand();

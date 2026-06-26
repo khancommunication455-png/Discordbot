@@ -54,7 +54,7 @@ export default {
       if (!isAdmin) {
         return interaction.reply({
           embeds: [new EmbedBuilder().setColor(C.error).setTitle('No Permission').setDescription('You need **Manage Server** permission to use this command.').setFooter(FOOTER).setTimestamp()],
-          ephemeral: true,
+          flags: [64],
         });
       }
     }
@@ -128,7 +128,7 @@ export default {
       if (!db.data.leveling[guildId]) db.data.leveling[guildId] = { users: {} };
       db.data.leveling[guildId].users[target.id] = data;
       await saveDb();
-      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Set').setDescription(`**${target.username}** → ${xp.toLocaleString()} XP (Level ${lvl})`).setFooter(FOOTER).setTimestamp()], ephemeral: true });
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Set').setDescription(`**${target.username}** → ${xp.toLocaleString()} XP (Level ${lvl})`).setFooter(FOOTER).setTimestamp()], flags: [64] });
     }
 
     if (sub === 'addxp') {
@@ -142,7 +142,7 @@ export default {
       if (!db.data.leveling[guildId]) db.data.leveling[guildId] = { users: {} };
       db.data.leveling[guildId].users[target.id] = data;
       await saveDb();
-      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Added').setDescription(`Added **${amount.toLocaleString()} XP** to **${target.username}**. Now Level ${data.level}.`).setFooter(FOOTER).setTimestamp()], ephemeral: true });
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Added').setDescription(`Added **${amount.toLocaleString()} XP** to **${target.username}**. Now Level ${data.level}.`).setFooter(FOOTER).setTimestamp()], flags: [64] });
     }
 
     if (sub === 'resetxp') {
@@ -150,7 +150,7 @@ export default {
       if (!db.data.leveling[guildId]) db.data.leveling[guildId] = { users: {} };
       db.data.leveling[guildId].users[target.id] = { xp: 0, level: 0, totalXp: 0 };
       await saveDb();
-      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Reset').setDescription(`**${target.username}**'s XP has been reset to 0.`).setFooter(FOOTER).setTimestamp()], ephemeral: true });
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle('XP Reset').setDescription(`**${target.username}**'s XP has been reset to 0.`).setFooter(FOOTER).setTimestamp()], flags: [64] });
     }
   },
 };

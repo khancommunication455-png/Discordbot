@@ -16,7 +16,7 @@ export default {
     if (!process.env.REMOVE_BG_API_KEY) {
       return interaction.reply({
         embeds: [errorEmbed('Not Configured', 'REMOVE_BG_API_KEY is not set in .env.\nGet a free key at https://www.remove.bg/api')],
-        ephemeral: true,
+        flags: [64],
       });
     }
 

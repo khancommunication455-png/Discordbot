@@ -35,13 +35,13 @@ export default {
     if (!voiceChannel && sub !== 'queue' && sub !== 'nowplaying') {
       return interaction.reply({
         embeds: [new EmbedBuilder().setColor(C.error).setTitle('Not in Voice').setDescription('Join a voice channel first!').setFooter(FOOTER).setTimestamp()],
-        ephemeral: true
+        flags: [64]
       });
     }
 
     const reply = (embed, eph = false) => {
       if (interaction.replied || interaction.deferred) return interaction.editReply({ embeds: [embed] });
-      return interaction.reply({ embeds: [embed], ephemeral: eph });
+      return interaction.reply({ embeds: [embed], ...(eph ? { flags: [64] } : {}) });
     };
 
     const queue = useQueue(interaction.guildId);

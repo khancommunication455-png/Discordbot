@@ -139,14 +139,14 @@ export default {
       if (!db.data.userNotes[guildId][user.id]) db.data.userNotes[guildId][user.id] = [];
       db.data.userNotes[guildId][user.id].push({ note, mod: interaction.user.id, ts: Date.now() });
       await saveDb();
-      return interaction.reply({ embeds: [successEmbed('Note Added', `Note saved for **${user.tag}**.`)], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Note Added', `Note saved for **${user.tag}**.`)], flags: [64] });
     }
 
     // ── NOTES ─────────────────────────────────────────────────────────────
     if (sub === 'notes') {
       const user  = interaction.options.getUser('user');
       const notes = db.data.userNotes[guildId][user.id] ?? [];
-      if (!notes.length) return interaction.reply({ embeds: [successEmbed('No Notes', `No notes for **${user.tag}**.`)], ephemeral: true });
+      if (!notes.length) return interaction.reply({ embeds: [successEmbed('No Notes', `No notes for **${user.tag}**.`)], flags: [64] });
       const fields = notes.map((n, i) => ({
         name:  `Note ${i + 1} — <t:${Math.floor(n.ts / 1000)}:D> by <@${n.mod}>`,
         value: n.note,
@@ -154,7 +154,7 @@ export default {
       }));
       return interaction.reply({
         embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`📝 Notes for ${user.tag}`).addFields(fields).setTimestamp()],
-        ephemeral: true,
+        flags: [64],
       });
     }
   },

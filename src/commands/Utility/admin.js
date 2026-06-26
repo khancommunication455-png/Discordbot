@@ -53,21 +53,21 @@ export default {
         .setTimestamp();
 
       await channel.send({ content: ping || undefined, embeds: [embed] });
-      return interaction.reply({ embeds: [successEmbed('Announced', `Message sent to ${channel}.`)], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Announced', `Message sent to ${channel}.`)], flags: [64] });
     }
 
     if (sub === 'say') {
       const channel = interaction.options.getChannel('channel');
       const msg     = interaction.options.getString('message');
       await channel.send(msg);
-      return interaction.reply({ embeds: [successEmbed('Sent', `Message sent to ${channel}.`)], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Sent', `Message sent to ${channel}.`)], flags: [64] });
     }
 
     if (sub === 'slowmode') {
       const seconds = interaction.options.getInteger('seconds');
       const channel = interaction.options.getChannel('channel') ?? interaction.channel;
       await channel.setRateLimitPerUser(seconds);
-      return interaction.reply({ embeds: [successEmbed('Slowmode', `${channel} slowmode set to **${seconds}s**.`)], ephemeral: true });
+      return interaction.reply({ embeds: [successEmbed('Slowmode', `${channel} slowmode set to **${seconds}s**.`)], flags: [64] });
     }
 
     if (sub === 'dm') {
@@ -75,9 +75,9 @@ export default {
       const msg  = interaction.options.getString('message');
       try {
         await user.send(msg);
-        return interaction.reply({ embeds: [successEmbed('DM Sent', `Message sent to ${user.tag}.`)], ephemeral: true });
+        return interaction.reply({ embeds: [successEmbed('DM Sent', `Message sent to ${user.tag}.`)], flags: [64] });
       } catch {
-        return interaction.reply({ embeds: [errorEmbed('DM Failed', `Could not DM ${user.tag}. They may have DMs closed.`)], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('DM Failed', `Could not DM ${user.tag}. They may have DMs closed.`)], flags: [64] });
       }
     }
   },

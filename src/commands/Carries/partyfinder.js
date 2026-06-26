@@ -83,7 +83,7 @@ export default {
       const collector = msg.createMessageComponentCollector({ time: 30 * 60 * 1000 });
       collector.on('collect', async i => {
         if (i.user.id === interaction.user.id) {
-          return i.reply({ content: "You can't join your own party!", ephemeral: true });
+          return i.reply({ content: "You can't join your own party!", flags: [64] });
         }
         try {
           const owner = await client.users.fetch(interaction.user.id);
@@ -95,9 +95,9 @@ export default {
               .setTimestamp()
             ],
           });
-          await i.reply({ content: `✅ Notified **${ign}** — check DMs!`, ephemeral: true });
+          await i.reply({ content: `✅ Notified **${ign}** — check DMs!`, flags: [64] });
         } catch {
-          await i.reply({ content: `DM **${ign}** directly to join.`, ephemeral: true });
+          await i.reply({ content: `DM **${ign}** directly to join.`, flags: [64] });
         }
       });
     }
