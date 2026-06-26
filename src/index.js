@@ -119,7 +119,9 @@ async function main() {
       highWaterMark: 1 << 25
     }
   });
-  await player.extractors.loadMulti(DefaultExtractors);
+  
+  // FIXED: Replaced loadMulti with modern v6 loadDefault syntax 
+  await player.extractors.loadDefault((ext) => DefaultExtractors.includes(ext));
   console.log('🎵 Music Player ready');
 
   await loadCommands(path.join(__dirname, 'commands'));
