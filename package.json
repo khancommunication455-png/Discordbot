@@ -1,7 +1,7 @@
 {
   "name": "skybot",
   "version": "1.0.0",
-  "description": "All-in-one Hypixel Skyblock Discord Bot — TITAN Jr.",
+  "description": "All-in-one Hypixel Skyblock Discord Bot \u2014 TITAN Jr.",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -12,11 +12,8 @@
   "dependencies": {
     "@discordjs/rest": "^2.4.0",
     "@discordjs/voice": "^0.18.0",
-    "@discord-player/extractor": "^4.4.5",
     "@distube/ytdl-core": "^4.15.1",
     "axios": "^1.7.2",
-    "discord-player": "^6.7.1",
-    "discord-player-ytdl-core": "^3.0.2",
     "discord.js": "^14.15.3",
     "dotenv": "^16.4.5",
     "ejs": "^3.1.10",
