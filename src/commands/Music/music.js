@@ -4,7 +4,8 @@ import {
   AudioPlayerStatus, VoiceConnectionStatus, StreamType, NoSubscriberBehavior,
   entersState,
 } from '@discordjs/voice';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, execFileSync } from 'child_process';
+import { existsSync } from 'fs';
 import { C } from '../../utils/embeds.js';
 
 const FOOTER = { text: 'TITAN Jr. Music' };
@@ -12,50 +13,49 @@ const FOOTER = { text: 'TITAN Jr. Music' };
 // ── Find yt-dlp ──────────────────────────────────────────────────────────────
 function findYtDlp() {
   for (const p of ['/root/.nix-profile/bin/yt-dlp', '/app/venv/bin/yt-dlp', 'yt-dlp']) {
-    try { execSync(`${p} --version`, { stdio: 'pipe' }); return p; } catch {}
+    try { execSync(`"${p}" --version`, { stdio: 'pipe' }); return p; } catch {}
   }
   return 'yt-dlp';
 }
 
 // ── Find ffmpeg ───────────────────────────────────────────────────────────────
 function findFFmpeg() {
-  for (const p of ['/root/.nix-profile/bin/ffmpeg', '/usr/bin/ffmpeg', 'ffmpeg']) {
-    try {
-      if (p === 'ffmpeg') { execSync('ffmpeg -version', { stdio: 'pipe' }); return p; }
-      const { existsSync } = await import('fs'); // can't await here, use sync check
-      return p; // yt-dlp will find ffmpeg itself
-    } catch {}
+  for (const p of [process.env.FFMPEG_PATH, '/root/.nix-profile/bin/ffmpeg', '/usr/bin/ffmpeg', 'ffmpeg']) {
+    if (!p) continue;
+    if (p === 'ffmpeg' || existsSync(p)) return p;
   }
   return 'ffmpeg';
 }
 
-// Per-guild state: { connection, player, queue: [{title,url,duration,thumbnail,author}], current, voiceChannelId }
+const YTDLP = findYtDlp();
+const FFMPEG = findFFmpeg();
+
+// Per-guild music state
 const musicState = new Map();
 
 async function resolveTrack(query) {
-  const ytdlp = findYtDlp();
   const isUrl = /^https?:\/\//.test(query);
   const args = [
-    '--dump-json', '--no-playlist', '--flat-playlist',
+    '--dump-json', '--no-playlist',
     '-f', 'bestaudio',
     '--no-warnings',
     isUrl ? query : `ytsearch1:${query}`,
   ];
   return new Promise((resolve, reject) => {
     let out = '';
-    const proc = spawn(ytdlp, args);
-    proc.stdout.on('data', d => out += d);
+    const proc = spawn(YTDLP, args);
+    proc.stdout.on('data', d => { out += d; });
     proc.stderr.on('data', () => {});
-    proc.on('close', code => {
+    proc.on('close', () => {
       try {
-        const lines = out.trim().split('\n').filter(Boolean);
-        const info = JSON.parse(lines[0]);
+        const info = JSON.parse(out.trim().split('\n')[0]);
+        const dur = info.duration || 0;
         resolve({
-          title: info.title || query,
-          url: info.webpage_url || info.url || query,
-          duration: info.duration_string || String(Math.floor((info.duration||0)/60)).padStart(2,'0')+':'+String((info.duration||0)%60).padStart(2,'0'),
+          title:     info.title || query,
+          url:       info.webpage_url || info.url || query,
+          duration:  info.duration_string || `${Math.floor(dur/60)}:${String(dur%60).padStart(2,'0')}`,
           thumbnail: info.thumbnail || null,
-          author: info.uploader || info.channel || 'Unknown',
+          author:    info.uploader || info.channel || 'Unknown',
         });
       } catch { reject(new Error('Could not find that track')); }
     });
@@ -63,18 +63,17 @@ async function resolveTrack(query) {
   });
 }
 
-function streamTrack(url) {
-  const ytdlp = findYtDlp();
-  // yt-dlp pipes audio to stdout; ffmpeg transcodes to OggOpus for Discord
-  const dl = spawn(ytdlp, [
-    '-f', 'bestaudio',
+function createStream(url) {
+  const dl = spawn(YTDLP, [
+    '-f', 'bestaudio/best',
     '-o', '-',
     '--no-playlist',
     '--no-warnings',
+    '--no-part',
     url,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  const ff = spawn('/root/.nix-profile/bin/ffmpeg', [
+  const ff = spawn(FFMPEG, [
     '-i', 'pipe:0',
     '-c:a', 'libopus',
     '-b:a', '96k',
@@ -86,46 +85,43 @@ function streamTrack(url) {
   dl.stdout.pipe(ff.stdin);
   dl.stderr.on('data', () => {});
   ff.stderr.on('data', () => {});
-  dl.on('error', () => {});
+  dl.on('error', () => { try { ff.kill(); } catch {} });
   ff.on('error', () => {});
 
   return ff.stdout;
 }
 
-async function playNext(guildId, client) {
+async function playNext(guildId) {
   const state = musicState.get(guildId);
   if (!state || !state.queue.length) {
     if (state) state.current = null;
     return;
   }
-
   const track = state.queue.shift();
   state.current = track;
-
   try {
-    const audioStream = streamTrack(track.url);
-    const resource = createAudioResource(audioStream, {
+    const resource = createAudioResource(createStream(track.url), {
       inputType: StreamType.OggOpus,
       inlineVolume: true,
     });
-    resource.volume?.setVolume(0.8);
+    resource.volume?.setVolume(state.volume ?? 0.8);
     state.player.play(resource);
   } catch (err) {
     console.error('[Music] playNext error:', err.message);
     state.current = null;
-    setTimeout(() => playNext(guildId, client), 1000);
+    setTimeout(() => playNext(guildId), 1000);
   }
 }
 
 async function getOrCreateState(guild, voiceChannel) {
-  let state = musicState.get(guild.id);
-  if (state && state.voiceChannelId === voiceChannel.id) return state;
+  const existing = musicState.get(guild.id);
+  if (existing && existing.voiceChannelId === voiceChannel.id) return existing;
 
-  // Destroy old connection if switching channels
-  if (state) {
-    try { state.player.stop(true); } catch {}
-    try { state.connection.destroy(); } catch {}
+  if (existing) {
+    try { existing.player.stop(true); } catch {}
+    try { existing.connection.destroy(); } catch {}
     await new Promise(r => setTimeout(r, 500));
+    musicState.delete(guild.id);
   }
 
   const connection = joinVoiceChannel({
@@ -139,17 +135,21 @@ async function getOrCreateState(guild, voiceChannel) {
     await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
   } catch {
     connection.destroy();
-    throw new Error('Could not connect to voice channel');
+    throw new Error('Could not connect to voice channel — please try again');
   }
 
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   connection.subscribe(player);
 
-  state = { connection, player, queue: [], current: null, voiceChannelId: voiceChannel.id };
+  const state = { connection, player, queue: [], current: null, voiceChannelId: voiceChannel.id, volume: 0.8, loop: false };
   musicState.set(guild.id, state);
 
   player.on(AudioPlayerStatus.Idle, () => {
     if (!musicState.has(guild.id)) return;
+    const s = musicState.get(guild.id);
+    if (s.loop && s.current) {
+      s.queue.unshift(s.current);
+    }
     setTimeout(() => playNext(guild.id), 500);
   });
   player.on('error', err => {
@@ -164,7 +164,7 @@ async function getOrCreateState(guild, voiceChannel) {
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
-      connection.destroy();
+      try { connection.destroy(); } catch {}
       musicState.delete(guild.id);
     }
   });
@@ -173,7 +173,6 @@ async function getOrCreateState(guild, voiceChannel) {
   return state;
 }
 
-// ── Command ──────────────────────────────────────────────────────────────────
 export default {
   data: new SlashCommandBuilder()
     .setName('music')
@@ -199,6 +198,7 @@ export default {
   async execute(interaction) {
     const sub = interaction.options.getSubcommand();
     const voiceChannel = interaction.member.voice?.channel;
+    const state = musicState.get(interaction.guildId);
 
     const reply = (embed, eph = false) => {
       const opts = { embeds: [embed], ...(eph ? { flags: [64] } : {}) };
@@ -210,54 +210,46 @@ export default {
       return reply(new EmbedBuilder().setColor(C.error).setTitle('Not in Voice').setDescription('Join a voice channel first!').setFooter(FOOTER).setTimestamp(), true);
     }
 
-    const state = musicState.get(interaction.guildId);
-
-    // ── PLAY ─────────────────────────────────────────────────────────────────
     if (sub === 'play') {
       await interaction.deferReply();
       const query = interaction.options.getString('query');
-
       try {
         const track = await resolveTrack(query);
         const s = await getOrCreateState(interaction.guild, voiceChannel);
         s.queue.push(track);
+        const wasIdle = s.current === null;
+        if (wasIdle) playNext(interaction.guildId);
 
-        const isPlaying = s.current !== null;
-        if (!isPlaying) playNext(interaction.guildId);
-
-        await interaction.editReply({
-          embeds: [new EmbedBuilder()
-            .setColor(C.music ?? '#1DB954')
-            .setTitle(isPlaying ? 'Added to Queue' : 'Now Playing')
-            .setDescription(`**[${track.title}](${track.url})**`)
-            .addFields(
-              { name: 'Duration', value: track.duration, inline: true },
-              { name: 'Author', value: track.author, inline: true },
-              { name: 'Position', value: isPlaying ? `#${s.queue.length}` : 'Up next', inline: true },
-            )
-            .setThumbnail(track.thumbnail)
-            .setFooter(FOOTER).setTimestamp()
-          ],
-        });
+        await interaction.editReply({ embeds: [new EmbedBuilder()
+          .setColor(C.music ?? '#1DB954')
+          .setTitle(wasIdle ? 'Now Playing' : 'Added to Queue')
+          .setDescription(`**[${track.title}](${track.url})**`)
+          .addFields(
+            { name: 'Duration', value: track.duration, inline: true },
+            { name: 'Author',   value: track.author,   inline: true },
+            { name: 'Position', value: wasIdle ? 'Now' : `#${s.queue.length}`, inline: true },
+          )
+          .setThumbnail(track.thumbnail)
+          .setFooter(FOOTER).setTimestamp()
+        ]});
       } catch (err) {
         console.error('[Music Play Error]', err);
-        await interaction.editReply({
-          embeds: [new EmbedBuilder().setColor(C.error).setTitle('Error').setDescription(`${err.message}`).setFooter(FOOTER).setTimestamp()],
-        });
+        await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('Error').setDescription(err.message).setFooter(FOOTER).setTimestamp()] });
       }
     }
 
     else if (sub === 'skip') {
       if (!state?.current) return reply(new EmbedBuilder().setColor(C.error).setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp(), true);
       const title = state.current.title;
+      state.loop = false;
       state.player.stop();
       return reply(new EmbedBuilder().setColor(C.success ?? '#57F287').setTitle('Skipped').setDescription(`Skipped **${title}**`).setFooter(FOOTER).setTimestamp());
     }
 
     else if (sub === 'stop') {
       if (!state) return reply(new EmbedBuilder().setColor(C.error).setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp(), true);
-      state.queue = [];
-      state.player.stop(true);
+      state.queue = []; state.current = null; state.loop = false;
+      try { state.player.stop(true); } catch {}
       try { state.connection.destroy(); } catch {}
       musicState.delete(interaction.guildId);
       return reply(new EmbedBuilder().setColor(C.success ?? '#57F287').setTitle('Stopped').setDescription('Queue cleared and bot left.').setFooter(FOOTER).setTimestamp());
@@ -269,10 +261,9 @@ export default {
       return reply(new EmbedBuilder()
         .setColor(C.music ?? '#1DB954')
         .setTitle('Music Queue')
-        .setDescription(`**Now Playing:** [${state.current.title}](${state.current.url})\n\n${list || 'Queue is empty.'}`)
-        .setFooter({ text: `TITAN Jr. Music · ${state.queue.length} tracks in queue` })
-        .setTimestamp()
-      );
+        .setDescription(`**Now Playing:** [${state.current.title}](${state.current.url})\n\n${list || 'No more tracks.'}`)
+        .setFooter({ text: `${state.queue.length} track(s) in queue · Loop: ${state.loop ? 'ON' : 'OFF'}` })
+        .setTimestamp());
     }
 
     else if (sub === 'pause') {
@@ -294,27 +285,25 @@ export default {
     }
 
     else if (sub === 'volume') {
-      if (!state?.current) return reply(new EmbedBuilder().setColor(C.error).setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp(), true);
-      // volume is handled per-resource; store for next track
-      state.volume = interaction.options.getInteger('level') / 100;
-      return reply(new EmbedBuilder().setColor(C.music ?? '#1DB954').setTitle('Volume').setDescription(`Volume set to **${interaction.options.getInteger('level')}%** (applies to next track)`).setFooter(FOOTER).setTimestamp());
+      const level = interaction.options.getInteger('level');
+      if (state) state.volume = level / 100;
+      return reply(new EmbedBuilder().setColor(C.music ?? '#1DB954').setTitle('Volume').setDescription(`Volume set to **${level}%**`).setFooter(FOOTER).setTimestamp());
     }
 
     else if (sub === 'nowplaying') {
       if (!state?.current) return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp());
-      const track = state.current;
+      const t = state.current;
       return reply(new EmbedBuilder()
         .setColor(C.music ?? '#1DB954')
         .setTitle('Now Playing')
-        .setDescription(`**[${track.title}](${track.url})**`)
-        .setThumbnail(track.thumbnail)
+        .setDescription(`**[${t.title}](${t.url})**`)
+        .setThumbnail(t.thumbnail)
         .addFields(
-          { name: 'Duration', value: track.duration, inline: true },
-          { name: 'Author', value: track.author, inline: true },
-          { name: 'Queue', value: `${state.queue.length} track(s) after this`, inline: true },
+          { name: 'Duration', value: t.duration, inline: true },
+          { name: 'Author',   value: t.author,   inline: true },
+          { name: 'Queue',    value: `${state.queue.length} up next`, inline: true },
         )
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setFooter(FOOTER).setTimestamp());
     }
   },
 };

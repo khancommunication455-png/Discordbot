@@ -8,7 +8,7 @@ import {
   AudioPlayerStatus, VoiceConnectionStatus, StreamType, NoSubscriberBehavior,
   entersState,
 } from '@discordjs/voice';
-import { exec, execSync } from 'child_process';
+import { exec, execSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import {
   existsSync, mkdirSync, unlinkSync, readFileSync,
@@ -50,7 +50,6 @@ function findFFmpeg() {
 // ── Detect edge-tts ────────────────────────────────────────────────────────
 let EDGE_TTS_CMD = null;
 try {
-  const { execSync } = await import('child_process');
   for (const cmd of [
     '/app/venv/bin/edge-tts',
     'edge-tts',
@@ -182,7 +181,13 @@ export async function setupTTS(guild, voiceChannelId, textChannelId) {
     selfDeaf: false, selfMute: false,
   });
 
-  await new Promise(r => setTimeout(r, 3000));
+  // Wait for connection to be ready (max 10s) instead of blind sleep
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+  } catch {
+    connection.destroy();
+    throw new Error('Could not connect to voice channel');
+  }
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -267,7 +272,6 @@ async function processQueue(guildId) {
     // Feeding OggOpus means @discordjs/voice never needs to re-encode,
     // so opusscript (pure-JS fallback) is bypassed entirely.
     const ffmpegBin = findFFmpeg();
-    const { spawn } = await import('child_process');
     const ffmpegProc = spawn(ffmpegBin, [
       '-i', playFile,
       '-c:a', 'libopus',
