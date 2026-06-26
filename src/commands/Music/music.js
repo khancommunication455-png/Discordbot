@@ -12,9 +12,10 @@ const FOOTER = { text: 'TITAN Jr. Music' };
 
 // ── Find yt-dlp ──────────────────────────────────────────────────────────────
 function findYtDlp() {
-  for (const p of ['/root/.nix-profile/bin/yt-dlp', '/app/venv/bin/yt-dlp', 'yt-dlp']) {
-    try { execSync(`"${p}" --version`, { stdio: 'pipe' }); return p; } catch {}
+  for (const p of ['/root/.nix-profile/bin/yt-dlp', '/app/venv/bin/yt-dlp', '/usr/bin/yt-dlp', 'yt-dlp']) {
+    try { execSync(`${p} --version`, { stdio: 'pipe' }); console.log('[Music] yt-dlp found at:', p); return p; } catch {}
   }
+  console.error('[Music] yt-dlp not found!');
   return 'yt-dlp';
 }
 
@@ -35,20 +36,28 @@ const musicState = new Map();
 
 async function resolveTrack(query) {
   const isUrl = /^https?:\/\//.test(query);
+  // No -f flag during info extraction — format selection only applies at download time
   const args = [
-    '--dump-json', '--no-playlist',
-    '-f', 'bestaudio',
+    '--dump-json',
+    '--no-playlist',
     '--no-warnings',
+    '--default-search', 'ytsearch',
     isUrl ? query : `ytsearch1:${query}`,
   ];
   return new Promise((resolve, reject) => {
     let out = '';
+    let errOut = '';
     const proc = spawn(YTDLP, args);
     proc.stdout.on('data', d => { out += d; });
-    proc.stderr.on('data', () => {});
-    proc.on('close', () => {
+    proc.stderr.on('data', d => { errOut += d; });
+    proc.on('close', code => {
       try {
-        const info = JSON.parse(out.trim().split('\n')[0]);
+        const lines = out.trim().split('\n').filter(l => l.startsWith('{'));
+        if (!lines.length) {
+          console.error('[Music] yt-dlp no JSON output. stderr:', errOut.slice(0, 300));
+          return reject(new Error('Could not find that track'));
+        }
+        const info = JSON.parse(lines[0]);
         const dur = info.duration || 0;
         resolve({
           title:     info.title || query,
@@ -57,9 +66,15 @@ async function resolveTrack(query) {
           thumbnail: info.thumbnail || null,
           author:    info.uploader || info.channel || 'Unknown',
         });
-      } catch { reject(new Error('Could not find that track')); }
+      } catch (e) {
+        console.error('[Music] yt-dlp parse error:', e.message, '| stderr:', errOut.slice(0, 300));
+        reject(new Error('Could not find that track'));
+      }
     });
-    proc.on('error', reject);
+    proc.on('error', e => {
+      console.error('[Music] yt-dlp spawn error:', e.message);
+      reject(new Error(`yt-dlp not found: ${e.message}`));
+    });
   });
 }
 
@@ -83,10 +98,10 @@ function createStream(url) {
   ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
   dl.stdout.pipe(ff.stdin);
-  dl.stderr.on('data', () => {});
+  dl.stderr.on('data', d => { const s = d.toString(); if (!s.includes('fragment')) console.error('[Music][yt-dlp]', s.trim().slice(0,200)); });
   ff.stderr.on('data', () => {});
-  dl.on('error', () => { try { ff.kill(); } catch {} });
-  ff.on('error', () => {});
+  dl.on('error', e => { console.error('[Music][yt-dlp spawn]', e.message); try { ff.kill(); } catch {} });
+  ff.on('error', e => { console.error('[Music][ffmpeg spawn]', e.message); });
 
   return ff.stdout;
 }
