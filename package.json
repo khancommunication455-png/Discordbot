@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "deploy": "node src/deploy-commands.js",
-    "postinstall": "node scripts/setup.js"
+    "deploy": "node src/deploy-commands.js"
   },
   "dependencies": {
     "@discordjs/rest": "^2.4.0",
