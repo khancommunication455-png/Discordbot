@@ -32,6 +32,7 @@ import { startAuctionSoldWatcher } from './services/auctionSoldWatcher.js';
 import { startAHChatBot } from './services/ahChatBot.js';
 import { startWebDashboard } from './web/server.js';
 import { Player } from 'discord-player';
+import { YoutubeiExtractor } from 'discord-player-youtubei';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -127,12 +128,8 @@ async function main() {
   });
   
   try {
-    if (typeof player.extractors?.loadDefault === 'function') {
-      await player.extractors.loadDefault();
-      console.log('🎵 Music Player ready');
-    } else {
-      console.warn('⚠️ discord-player extractor loader is unavailable in this runtime; continuing without built-in extractors');
-    }
+    await player.extractors.register(YoutubeiExtractor, {});
+    console.log('🎵 Music Player ready (youtubei)');
   } catch (err) {
     console.warn(`⚠️ Failed to initialize discord-player extractors: ${err.message}`);
     console.warn('Continuing startup without music extractors.');

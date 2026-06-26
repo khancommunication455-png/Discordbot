@@ -11,7 +11,7 @@ import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import {
   existsSync, mkdirSync, unlinkSync, readFileSync,
-  writeFileSync, createReadStream,
+  writeFileSync,
 } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -244,21 +244,35 @@ async function processQueue(guildId) {
     const playFile = join(TMP_DIR, `play_${Date.now()}.mp3`);
     writeFileSync(playFile, mp3Buffer);
 
-    // Create audio resource from file stream
-    // StreamType.Arbitrary → ffmpeg will decode the MP3
-    const resource = createAudioResource(createReadStream(playFile), {
-      inputType:    StreamType.Arbitrary,
+    // Use ffmpeg to transcode MP3 → OggOpus stream directly.
+    // Feeding OggOpus means @discordjs/voice never needs to re-encode,
+    // so opusscript (pure-JS fallback) is bypassed entirely.
+    const ffmpegBin = findFFmpeg();
+    const { spawn } = await import('child_process');
+    const ffmpegProc = spawn(ffmpegBin, [
+      '-i', playFile,
+      '-c:a', 'libopus',
+      '-b:a', '96k',
+      '-vbr', 'on',
+      '-f', 'ogg',
+      'pipe:1',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    ffmpegProc.stderr.on('data', () => {}); // suppress ffmpeg logs
+
+    const resource = createAudioResource(ffmpegProc.stdout, {
+      inputType: StreamType.OggOpus,
       inlineVolume: true,
     });
     resource.volume?.setVolume(1.0);
 
-    // Cleanup file after stream ends
-    resource.playStream.on('close', () => {
+    // Cleanup file after ffmpeg exits
+    ffmpegProc.on('close', () => {
       try { unlinkSync(playFile); } catch {}
     });
 
     state.player.play(resource);
-    console.log('[TTS] player.play() called');
+    console.log('[TTS] player.play() called (OggOpus via ffmpeg)');
 
   } catch (err) {
     console.error('[TTS] processQueue error:', err.message);

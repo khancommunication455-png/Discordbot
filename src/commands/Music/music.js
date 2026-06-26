@@ -61,7 +61,7 @@ export default {
             leaveOnEnd: true,
             leaveOnEndCooldown: 300000,
           },
-          searchEngine: 'youtube'
+          searchEngine: 'youtubeSearch'
         });
 
         await interaction.editReply({
