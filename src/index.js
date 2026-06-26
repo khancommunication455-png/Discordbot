@@ -31,8 +31,7 @@ import { startAHFlipWatcher } from './services/ahFlipWatcher.js';
 import { startAuctionSoldWatcher } from './services/auctionSoldWatcher.js';
 import { startAHChatBot } from './services/ahChatBot.js';
 import { startWebDashboard } from './web/server.js';
-import { Player } from 'discord-player';
-import { YoutubeiExtractor } from 'discord-player-youtubei';
+// Music now handled directly in music.js via yt-dlp
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -111,29 +110,7 @@ async function main() {
   await initDb();
   console.log('📦 Database ready');
 
-  // Initialize music player
-  const player = new Player(client, {
-    ytdlOptions: {
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25
-    }
-  });
-
-  // Global voice events handling to prevent unhandled promise rejections on Railway
-  player.events.on('error', (queue, error) => {
-    console.error(`[Player Error] Queue ${queue.guild.id} ran into an error:`, error.message);
-  });
-  player.events.on('playerError', (queue, error) => {
-    console.error(`[Player Connection Error] Connection issue in queue ${queue.guild.id}:`, error.message);
-  });
-  
-  try {
-    await player.extractors.register(YoutubeiExtractor, {});
-    console.log('🎵 Music Player ready (youtubei)');
-  } catch (err) {
-    console.warn(`⚠️ Failed to initialize discord-player extractors: ${err.message}`);
-    console.warn('Continuing startup without music extractors.');
-  }
+  console.log('🎵 Music Player ready (yt-dlp)');
 
   await loadCommands(path.join(__dirname, 'commands'));
   await loadEvents(path.join(__dirname, 'events'));

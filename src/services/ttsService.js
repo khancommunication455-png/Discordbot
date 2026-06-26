@@ -6,6 +6,7 @@
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
   AudioPlayerStatus, VoiceConnectionStatus, StreamType, NoSubscriberBehavior,
+  entersState,
 } from '@discordjs/voice';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
@@ -203,8 +204,26 @@ export async function setupTTS(guild, voiceChannelId, textChannelId) {
     setTimeout(() => processQueue(guild.id), 500);
   });
   connection.on('error', err => console.error('[TTS] Connection error:', err.message));
-  connection.on(VoiceConnectionStatus.Disconnected, () => {
-    console.warn('[TTS] Disconnected from VC');
+
+  // Auto-reconnect on disconnect instead of wiping state
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    console.warn('[TTS] Disconnected — attempting reconnect...');
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      // Reconnecting — do nothing, let it recover
+    } catch {
+      // Failed to reconnect — clean up
+      console.warn('[TTS] Reconnect failed, destroying connection');
+      try { connection.destroy(); } catch {}
+      ttsState.delete(guild.id);
+    }
+  });
+
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    console.warn('[TTS] Connection destroyed');
     ttsState.delete(guild.id);
   });
 
