@@ -2,20 +2,21 @@ import 'dotenv/config';
 import { execSync } from 'child_process';
 import { existsSync, copyFileSync } from 'fs';
 
-// ── Sodium ESM patch (must run before @discordjs/voice loads) ──────────────
-// libsodium-wrappers ESM imports './libsodium.mjs' which is missing from its
-// own package — it lives in the separate 'libsodium' package. Copy it at runtime
-// so voice encryption works on Railway.
+// ── Sodium ESM patch (ALWAYS overwrite — Docker cache may have stale file) ───
+import { createRequire as _cr } from 'module';
+const _require = _cr(import.meta.url);
 try {
-  const src  = new URL('../node_modules/libsodium/dist/modules-esm/libsodium.mjs', import.meta.url).pathname;
-  const dest = new URL('../node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs', import.meta.url).pathname;
-  if (existsSync(src) && !existsSync(dest)) {
-    copyFileSync(src, dest);
-    console.log('[Sodium] libsodium.mjs patched ✅');
-  } else if (existsSync(dest)) {
-    console.log('[Sodium] libsodium.mjs already present ✅');
+  const _path = _require('path');
+  const _base = _path.dirname(_require.resolve('libsodium-wrappers/package.json'));
+  const src   = _path.join(_path.dirname(_require.resolve('libsodium/package.json')),
+                            'dist/modules-esm/libsodium.mjs');
+  const dest  = _path.join(_base, 'dist/modules-esm/libsodium.mjs');
+  if (existsSync(src)) {
+    copyFileSync(src, dest); // always overwrite — never rely on cached state
+    const size = (await import('fs')).default.statSync(dest).size;
+    console.log(`[Sodium] patched ✅ (${size} bytes)`);
   } else {
-    console.warn('[Sodium] libsodium.mjs source not found — voice encryption may fail');
+    console.warn('[Sodium] source not found at:', src);
   }
 } catch (e) {
   console.warn('[Sodium] patch error:', e.message);
