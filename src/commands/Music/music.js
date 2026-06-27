@@ -5,8 +5,8 @@ import {
   NoSubscriberBehavior, entersState,
 } from '@discordjs/voice';
 import ytdl from '@distube/ytdl-core';
-import { existsSync } from 'fs';           // ✅ only fs stuff from 'fs'
-import { execSync, spawn } from 'child_process'; // ✅ execSync from correct module
+import { existsSync } from 'fs';
+import { execSync, spawn } from 'child_process';
 import { C } from '../../utils/embeds.js';
 
 const FOOTER = { text: 'TITAN Jr. Music' };
@@ -50,7 +50,6 @@ async function searchYouTube(query) {
     };
   }
 
-  // YouTube search via public endpoint
   const res  = await fetch(
     `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%3D%3D`,
     { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' } }
@@ -73,7 +72,7 @@ async function searchYouTube(query) {
     duration:  dur,
     thumbnail: video.thumbnail?.thumbnails?.slice(-1)[0]?.url ?? null,
     author:    video.ownerText?.runs?.[0]?.text ?? 'Unknown',
-    info:      null, // fetched lazily when streaming
+    info:      null,
   };
 }
 
@@ -82,17 +81,15 @@ async function createAudioStream(track) {
   const info   = track.info ?? await ytdl.getInfo(track.url);
   const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
 
-  // Output raw PCM — DO NOT use OggOpus+inlineVolume, it requires
-  // opusscript native bindings which fail on Railway → silent audio.
   const ff = spawn(FFMPEG, [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
     '-i', format.url,
     '-vn',
-    '-f', 's16le',    // raw signed 16-bit little-endian PCM
-    '-ar', '48000',   // 48kHz required by Discord
-    '-ac', '2',       // stereo
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', '2',
     'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -102,8 +99,6 @@ async function createAudioStream(track) {
 }
 
 // ── Voice connection (Railway-proof) ───────────────────────────────────────
-// Railway has strict UDP — waiting for Ready always times out.
-// Strategy: wait for Signalling (WebSocket only, no UDP), then sleep 2.5s.
 async function buildConnection(guild, voiceChannelId) {
   const connection = joinVoiceChannel({
     channelId:      voiceChannelId,
@@ -120,7 +115,6 @@ async function buildConnection(guild, voiceChannelId) {
     throw new Error('Could not connect to voice channel — check bot has Connect + Speak permissions');
   }
 
-  // Let Railway UDP negotiate in background before we push audio
   await new Promise(r => setTimeout(r, 2500));
   console.log('[Music] Connection ready ✅');
   return connection;
@@ -129,48 +123,79 @@ async function buildConnection(guild, voiceChannelId) {
 // ── Per-guild music state ──────────────────────────────────────────────────
 const musicState = new Map();
 
-async function playNext(guildId) {
+// ── playNext — SINGLETON per guild ────────────────────────────────────────
+// `state.playing` is a Promise while a track is being fetched/played, null otherwise.
+// Callers just call kickPlay(guildId) — it's a no-op if already playing.
+
+function kickPlay(guildId) {
   const state = musicState.get(guildId);
-  // Guard: state was cleaned up (connection destroyed) or already playing
-  if (!state || state.playing) return;
+  if (!state) return;
+  if (state.playing) return; // already running, the loop will pick up next track
 
-  if (!state.queue.length) {
-    state.current = null;
-    return;
-  }
-
-  // Guard: connection is gone — don't attempt to play
-  if (!state.connection || state.connectionDead) {
-    console.warn('[Music] playNext skipped — connection is dead');
-    return;
-  }
-
-  const track  = state.queue.shift();
-  state.current = track;
-  state.playing = true;
-
-  try {
-    const stream   = await createAudioStream(track);
-
-    // Re-check state after async stream fetch (connection may have died)
+  state.playing = _playLoop(guildId).finally(() => {
     const s = musicState.get(guildId);
-    if (!s || s.connectionDead) {
-      console.warn('[Music] playNext aborted — connection died during stream fetch');
-      state.playing = false;
+    if (s) s.playing = null;
+  });
+}
+
+async function _playLoop(guildId) {
+  while (true) {
+    const state = musicState.get(guildId);
+    if (!state) return; // guild cleaned up
+
+    if (!state.queue.length) {
+      state.current = null;
       return;
     }
 
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Raw,   // Raw PCM — no opusscript needed
-      inlineVolume: false,
-    });
-    state.player.play(resource);
-    console.log(`[Music] Playing: ${track.title}`);
-  } catch (err) {
-    console.error('[Music] playNext error:', err.message);
-    state.current = null;
-    state.playing = false;
-    setTimeout(() => playNext(guildId), 1000);
+    const track = state.queue.shift();
+    state.current = track;
+
+    try {
+      const stream = await createAudioStream(track);
+
+      // Re-check: state may have been cleaned up during async stream fetch
+      const s = musicState.get(guildId);
+      if (!s) {
+        console.warn('[Music] State gone after stream fetch — aborting');
+        return;
+      }
+
+      const resource = createAudioResource(stream, {
+        inputType: StreamType.Raw,
+        inlineVolume: false,
+      });
+
+      // Wait for the track to finish playing
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const done = (err) => {
+          if (settled) return;
+          settled = true;
+          s.player.off(AudioPlayerStatus.Idle,  onIdle);
+          s.player.off('error', onErr);
+          if (err) reject(err); else resolve();
+        };
+        const onIdle = () => done(null);
+        const onErr  = (e) => done(e);
+
+        s.player.once(AudioPlayerStatus.Idle,  onIdle);
+        s.player.once('error', onErr);
+        s.player.play(resource);
+        console.log(`[Music] Playing: ${track.title}`);
+      });
+
+      // Handle loop
+      const s2 = musicState.get(guildId);
+      if (s2?.loop && track) s2.queue.unshift({ ...track });
+
+    } catch (err) {
+      console.error('[Music] playLoop error:', err.message);
+      const s = musicState.get(guildId);
+      if (s) s.current = null;
+      // Brief pause before trying next track
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
 }
 
@@ -195,33 +220,21 @@ async function getOrCreateState(guild, voiceChannel) {
   const state = {
     connection,
     player,
-    queue:         [],
-    current:       null,
+    queue:          [],
+    current:        null,
     voiceChannelId: voiceChannel.id,
-    volume:        0.8,
-    loop:          false,
-    playing:       false,
-    connectionDead: false,
+    volume:         0.8,
+    loop:           false,
+    playing:        null,  // Promise | null
   };
   musicState.set(guild.id, state);
 
-  // ── Player events ────────────────────────────────────────────────────
-  player.on(AudioPlayerStatus.Idle, () => {
-    const s = musicState.get(guild.id);
-    if (!s) return;
-    s.playing = false;
-    if (s.loop && s.current) s.queue.unshift({ ...s.current });
-    setTimeout(() => playNext(guild.id), 500);
-  });
-
+  // Player error: log only — _playLoop handles recovery via the settled promise
   player.on('error', err => {
     console.error('[Music] Player error:', err.message);
-    const s = musicState.get(guild.id);
-    if (s) s.playing = false;
-    setTimeout(() => playNext(guild.id), 1000);
   });
 
-  // ── Connection events ─────────────────────────────────────────────────
+  // Connection events
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     console.warn('[Music] Disconnected — attempting reconnect...');
     try {
@@ -239,8 +252,6 @@ async function getOrCreateState(guild, voiceChannel) {
 
   connection.on(VoiceConnectionStatus.Destroyed, () => {
     console.warn('[Music] Connection destroyed');
-    const s = musicState.get(guild.id);
-    if (s) s.connectionDead = true;
     musicState.delete(guild.id);
   });
 
@@ -287,7 +298,6 @@ export default {
     const voiceChannel = interaction.member?.voice?.channel;
     const state        = musicState.get(interaction.guildId);
 
-    // Helper — works whether we've deferred or not
     const reply = (embed, ephemeral = false) => {
       const opts = { embeds: [embed], ...(ephemeral ? { flags: [64] } : {}) };
       return (interaction.replied || interaction.deferred)
@@ -298,10 +308,6 @@ export default {
     const noVoiceEmbed = () => new EmbedBuilder()
       .setColor(C.error).setTitle('Not in Voice')
       .setDescription('Join a voice channel first!')
-      .setFooter(FOOTER).setTimestamp();
-
-    const nothingEmbed = () => new EmbedBuilder()
-      .setColor(C.error).setTitle('Nothing Playing')
       .setFooter(FOOTER).setTimestamp();
 
     // Commands that don't need voice
@@ -325,20 +331,20 @@ export default {
           return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp());
         const t = state.current;
         return reply(new EmbedBuilder()
-          .setColor(C.music ?? '#1DB954').setTitle('Now Playing')
+          .setColor(C.music ?? '#1DB954').setTitle('🎵 Now Playing')
           .setDescription(`**[${t.title}](${t.url})**`)
-          .setThumbnail(t.thumbnail)
           .addFields(
-            { name: 'Duration', value: t.duration,              inline: true },
-            { name: 'Author',   value: t.author,                inline: true },
+            { name: 'Duration', value: t.duration, inline: true },
+            { name: 'Author',   value: t.author,   inline: true },
             { name: 'Queue',    value: `${state.queue.length} up next`, inline: true },
           )
+          .setThumbnail(t.thumbnail)
           .setFooter(FOOTER).setTimestamp()
         );
       }
     }
 
-    // All other commands need voice
+    // All other commands need the user to be in a voice channel
     if (!voiceChannel)
       return reply(noVoiceEmbed(), true);
 
@@ -350,17 +356,17 @@ export default {
         const track = await searchYouTube(query);
         const s     = await getOrCreateState(interaction.guild, voiceChannel);
         s.queue.push(track);
-        const wasIdle = s.current === null;
-        if (wasIdle) playNext(interaction.guildId);
+        const isFirst = s.current === null && !s.playing;
+        kickPlay(interaction.guildId);
 
         return interaction.editReply({ embeds: [new EmbedBuilder()
           .setColor(C.music ?? '#1DB954')
-          .setTitle(wasIdle ? '🎵 Now Playing' : '📋 Added to Queue')
+          .setTitle(isFirst ? '🎵 Now Playing' : '📋 Added to Queue')
           .setDescription(`**[${track.title}](${track.url})**`)
           .addFields(
-            { name: 'Duration', value: track.duration,                           inline: true },
-            { name: 'Author',   value: track.author,                             inline: true },
-            { name: 'Position', value: wasIdle ? 'Playing now' : `#${s.queue.length}`, inline: true },
+            { name: 'Duration', value: track.duration,                                    inline: true },
+            { name: 'Author',   value: track.author,                                      inline: true },
+            { name: 'Position', value: isFirst ? 'Playing now' : `#${s.queue.length}`,   inline: true },
           )
           .setThumbnail(track.thumbnail)
           .setFooter(FOOTER).setTimestamp()
@@ -369,28 +375,33 @@ export default {
         console.error('[Music] play error:', err.message);
         return interaction.editReply({ embeds: [new EmbedBuilder()
           .setColor(C.error).setTitle('Error')
-          .setDescription(err.message)
+          .setDescription(`Could not play that track.\n\`${err.message}\``)
           .setFooter(FOOTER).setTimestamp()
         ]});
       }
     }
 
-    // ── SKIP ─────────────────────────────────────────────────────────
-    if (sub === 'skip') {
-      if (!state?.current) return reply(nothingEmbed(), true);
-      const title  = state.current.title;
-      state.loop   = false;
-      state.player.stop();
+    if (!state) {
       return reply(new EmbedBuilder()
-        .setColor(C.success ?? '#57F287').setTitle('⏭ Skipped')
+        .setColor(C.error).setTitle('Not Playing')
+        .setDescription('Nothing is playing. Use `/music play` to start.')
+        .setFooter(FOOTER).setTimestamp(), true
+      );
+    }
+
+    // ── SKIP ──────────────────────────────────────────────────────────
+    if (sub === 'skip') {
+      const title = state.current?.title ?? 'Unknown';
+      state.player.stop(); // triggers Idle → _playLoop continues to next
+      return reply(new EmbedBuilder()
+        .setColor(C.success).setTitle('⏭ Skipped')
         .setDescription(`Skipped **${title}**`)
         .setFooter(FOOTER).setTimestamp()
       );
     }
 
-    // ── STOP ─────────────────────────────────────────────────────────
+    // ── STOP ──────────────────────────────────────────────────────────
     if (sub === 'stop') {
-      if (!state) return reply(nothingEmbed(), true);
       state.queue   = [];
       state.current = null;
       state.loop    = false;
@@ -398,58 +409,50 @@ export default {
       try { state.connection.destroy(); } catch {}
       musicState.delete(interaction.guildId);
       return reply(new EmbedBuilder()
-        .setColor(C.success ?? '#57F287').setTitle('⏹ Stopped')
-        .setDescription('Queue cleared and bot left.')
+        .setColor(C.success).setTitle('⏹ Stopped')
+        .setDescription('Music stopped and queue cleared.')
         .setFooter(FOOTER).setTimestamp()
       );
     }
 
-    // ── PAUSE ────────────────────────────────────────────────────────
+    // ── PAUSE ─────────────────────────────────────────────────────────
     if (sub === 'pause') {
-      if (!state?.current) return reply(nothingEmbed(), true);
       state.player.pause();
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('⏸ Paused')
+        .setColor(C.info ?? '#5865F2').setTitle('⏸ Paused')
         .setFooter(FOOTER).setTimestamp()
       );
     }
 
-    // ── RESUME ───────────────────────────────────────────────────────
+    // ── RESUME ────────────────────────────────────────────────────────
     if (sub === 'resume') {
-      if (!state?.current) return reply(nothingEmbed(), true);
       state.player.unpause();
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('▶ Resumed')
+        .setColor(C.success).setTitle('▶ Resumed')
         .setFooter(FOOTER).setTimestamp()
       );
     }
 
-    // ── LOOP ─────────────────────────────────────────────────────────
+    // ── LOOP ──────────────────────────────────────────────────────────
     if (sub === 'loop') {
-      if (!state) return reply(nothingEmbed(), true);
       state.loop = !state.loop;
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('🔁 Loop')
+        .setColor(C.info ?? '#5865F2').setTitle('🔁 Loop')
         .setDescription(`Loop is now **${state.loop ? 'ON' : 'OFF'}**`)
         .setFooter(FOOTER).setTimestamp()
       );
     }
 
-    // ── VOLUME ───────────────────────────────────────────────────────
+    // ── VOLUME ────────────────────────────────────────────────────────
     if (sub === 'volume') {
       const level = interaction.options.getInteger('level');
-      if (state) {
-        state.volume = level / 100;
-        // Apply to currently playing resource if any
-        try { state.player._resource?.volume?.setVolume(state.volume); } catch {}
-      }
+      state.volume = level / 100;
+      try { state.player._resource?.volume?.setVolume(state.volume); } catch {}
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('🔊 Volume')
+        .setColor(C.info ?? '#5865F2').setTitle('🔊 Volume')
         .setDescription(`Volume set to **${level}%**`)
         .setFooter(FOOTER).setTimestamp()
       );
     }
   },
 };
-
-             
