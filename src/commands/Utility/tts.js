@@ -114,6 +114,19 @@ export default {
         });
       }
 
+      // Guard: voiceChannel can be null if the bot lacks VIEW_CHANNEL permission
+      // on the selected channel — Discord resolves it as null in that case.
+      if (!voiceChannel) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setColor(C.error)
+            .setTitle('Cannot Access Voice Channel')
+            .setDescription('I cannot see that voice channel. Make sure I have **View Channel** and **Connect** permissions there.')
+            .setFooter(FOOTER).setTimestamp()
+          ],
+        });
+      }
+
       try {
         await setupTTS(interaction.guild, voiceChannel.id, textChannel.id, aiMode, client);
 
@@ -288,4 +301,3 @@ export default {
     }
   },
 };
-                   
