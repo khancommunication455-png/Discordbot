@@ -1,6 +1,25 @@
 import 'dotenv/config';
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, copyFileSync } from 'fs';
+
+// ── Sodium ESM patch (must run before @discordjs/voice loads) ──────────────
+// libsodium-wrappers ESM imports './libsodium.mjs' which is missing from its
+// own package — it lives in the separate 'libsodium' package. Copy it at runtime
+// so voice encryption works on Railway.
+try {
+  const src  = new URL('../node_modules/libsodium/dist/modules-esm/libsodium.mjs', import.meta.url).pathname;
+  const dest = new URL('../node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs', import.meta.url).pathname;
+  if (existsSync(src) && !existsSync(dest)) {
+    copyFileSync(src, dest);
+    console.log('[Sodium] libsodium.mjs patched ✅');
+  } else if (existsSync(dest)) {
+    console.log('[Sodium] libsodium.mjs already present ✅');
+  } else {
+    console.warn('[Sodium] libsodium.mjs source not found — voice encryption may fail');
+  }
+} catch (e) {
+  console.warn('[Sodium] patch error:', e.message);
+}
 
 // Set FFMPEG_PATH for @discordjs/voice so it can find ffmpeg on Railway
 const ffmpegPaths = [
