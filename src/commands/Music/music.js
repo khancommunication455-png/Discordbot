@@ -82,16 +82,17 @@ async function createAudioStream(track) {
   const info   = track.info ?? await ytdl.getInfo(track.url);
   const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
 
+  // Output raw PCM — DO NOT use OggOpus+inlineVolume, it requires
+  // opusscript native bindings which fail on Railway → silent audio.
   const ff = spawn(FFMPEG, [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
     '-i', format.url,
     '-vn',
-    '-c:a', 'libopus',
-    '-b:a', '96k',
-    '-vbr', 'on',
-    '-f', 'ogg',
+    '-f', 's16le',    // raw signed 16-bit little-endian PCM
+    '-ar', '48000',   // 48kHz required by Discord
+    '-ac', '2',       // stereo
     'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -143,10 +144,9 @@ async function playNext(guildId) {
   try {
     const stream   = await createAudioStream(track);
     const resource = createAudioResource(stream, {
-      inputType: StreamType.OggOpus,
-      inlineVolume: true,
+      inputType: StreamType.Raw,   // Raw PCM — no opusscript needed
+      inlineVolume: false,
     });
-    resource.volume?.setVolume(state.volume ?? 0.8);
     state.player.play(resource);
     console.log(`[Music] Playing: ${track.title}`);
   } catch (err) {
@@ -426,4 +426,4 @@ export default {
     }
   },
 };
-        
+
