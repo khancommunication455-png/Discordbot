@@ -2,12 +2,13 @@
 nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python313"]
 
 [variables]
-PATH = "/app/venv/bin:$PATH"
+PATH = "/app/venv/bin:$NIXPACKS_PATH"
 
 [phases.install]
 cmds = [
   "python3 -m venv /app/venv && /app/venv/bin/pip install edge-tts yt-dlp -U -q",
-  "npm install"
+  "npm install",
+  "node -e \"const fs=require('fs');try{fs.copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs');console.log('[sodium] patched');}catch(e){console.log('[sodium] skip:',e.message);}\""
 ]
 
 [start]
