@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "deploy": "node src/deploy-commands.js",
-    "postinstall": "node -e \"const fs=require('fs');try{fs.copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs');console.log('[sodium] libsodium.mjs patched');}catch(e){console.log('[sodium] patch skipped:',e.message);}\""
+    "deploy": "node src/deploy-commands.js"
   },
   "dependencies": {
     "@discordjs/rest": "^2.4.0",
