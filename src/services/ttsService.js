@@ -198,23 +198,23 @@ function playMP3(state, mp3Buffer) {
     const playFile = join(TMP_DIR, `play_${Date.now()}.mp3`);
     writeFileSync(playFile, mp3Buffer);
 
+    // Use Arbitrary input type — ffmpeg outputs s16le PCM directly.
+    // DO NOT use OggOpus+inlineVolume: requires opusscript native bindings
+    // which fail silently on Railway → audio plays but no sound in VC.
     const ffmpegProc = spawn(FFMPEG, [
       '-i', playFile,
-      '-c:a', 'libopus',
-      '-b:a', '96k',
-      '-vbr', 'on',
-      '-compression_level', '10',
-      '-f', 'ogg',
+      '-f', 's16le',       // raw PCM — no opus encoding needed from JS side
+      '-ar', '48000',      // Discord requires 48kHz
+      '-ac', '2',          // stereo
       'pipe:1',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    ffmpegProc.stderr.on('data', () => {}); // suppress ffmpeg noise
+    ffmpegProc.stderr.on('data', () => {});
 
     const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType: StreamType.OggOpus,
-      inlineVolume: true,
+      inputType: StreamType.Raw,  // Raw PCM — voice lib handles opus encoding via ffmpeg
+      inlineVolume: false,        // no inline volume = no opusscript dependency
     });
-    resource.volume?.setVolume(1.0);
 
     ffmpegProc.on('close', () => { try { unlinkSync(playFile); } catch {} });
     ffmpegProc.on('error', reject);
@@ -222,7 +222,7 @@ function playMP3(state, mp3Buffer) {
     state.player.once(AudioPlayerStatus.Idle, resolve);
     state.player.once('error', reject);
     state.player.play(resource);
-    console.log('[TTS] player.play() called (OggOpus via ffmpeg)');
+    console.log('[TTS] player.play() called (Raw PCM via ffmpeg)');
   });
 }
 
@@ -235,15 +235,15 @@ function startKeepAlive(state) {
     if (state.active || state.connectionDead) return;
     try {
       const proc = spawn(FFMPEG, [
-        '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono',
+        '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
         '-t', '0.2',
-        '-c:a', 'libopus',
-        '-b:a', '8k',
-        '-f', 'ogg',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
         'pipe:1',
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
       proc.stderr.on('data', () => {});
-      const res = createAudioResource(proc.stdout, { inputType: StreamType.OggOpus });
+      const res = createAudioResource(proc.stdout, { inputType: StreamType.Raw });
       state.player.play(res);
     } catch {}
   }, 45_000);
@@ -549,4 +549,4 @@ export async function moveTTS(guild, newVcId) {
     startKeepAlive(s);
     return true;
   } catch { return false; }
-    }
+}
