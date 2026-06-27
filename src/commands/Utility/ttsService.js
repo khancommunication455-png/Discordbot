@@ -1,14 +1,11 @@
 /**
- * ttsService.js — TITAN Jr. Voice AI Service
+ * ttsService.js — TITAN Jr. Voice AI Service (fixed)
  *
- * Features:
- *  - Railway-proof voice connection (no Ready state wait)
- *  - Auto-rejoin when Discord kicks bot from VC
- *  - TTS via edge-tts (Microsoft Neural) → ffmpeg → OggOpus → Discord
- *  - Google TTS fallback
- *  - AI Assistant mode: users speak → Whisper STT → Groq LLM → TTS reply
- *  - Language detection (English / Roman Urdu / Hindi / Urdu script)
- *  - Persistent keep-alive silence to prevent UDP timeout on Railway
+ * Fixes applied:
+ *  1. processQueue is a singleton drain loop — only ONE instance runs per guild
+ *     at a time, enforced by a `draining` promise stored on state.
+ *  2. playMP3 uses a settled flag so once(Idle) and once(error) don't double-fire.
+ *  3. enqueueTTS always kicks the drain loop; the loop self-guards via the promise.
  */
 
 import {
@@ -35,9 +32,9 @@ const TMP_DIR    = join(__dirname, '../../tmp');
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
 
 // ── State ──────────────────────────────────────────────────────────────────
-// guildId → { player, connection, queue, active, textChannelId,
-//             voiceChannelId, adapterCreator, connectionDead,
-//             keepAliveInterval, aiMode, aiHistory, client }
+// guildId → { player, connection, queue, draining (Promise|null),
+//             textChannelId, voiceChannelId, adapterCreator,
+//             connectionDead, keepAliveInterval, aiMode, aiHistory, client }
 const ttsState = new Map();
 
 // ── Groq client ────────────────────────────────────────────────────────────
@@ -193,48 +190,46 @@ async function synthesize(text) {
 }
 
 // ── Play MP3 buffer on Discord voice ──────────────────────────────────────
+// Returns a Promise that resolves when the player goes Idle (track finished).
+// A `settled` flag prevents the Idle and error handlers from both resolving/rejecting.
 function playMP3(state, mp3Buffer) {
   return new Promise((resolve, reject) => {
     const playFile = join(TMP_DIR, `play_${Date.now()}.mp3`);
     writeFileSync(playFile, mp3Buffer);
 
-    // Use Arbitrary input type — ffmpeg outputs s16le PCM directly.
-    // DO NOT use OggOpus+inlineVolume: requires opusscript native bindings
-    // which fail silently on Railway → audio plays but no sound in VC.
     const ffmpegProc = spawn(FFMPEG, [
       '-i', playFile,
-      '-f', 's16le',       // raw PCM — no opus encoding needed from JS side
-      '-ar', '48000',      // Discord requires 48kHz
-      '-ac', '2',          // stereo
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
       'pipe:1',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
     ffmpegProc.stderr.on('data', () => {});
+    ffmpegProc.on('close', () => { try { unlinkSync(playFile); } catch {} });
 
     const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType: StreamType.Raw,  // Raw PCM — voice lib handles opus encoding via ffmpeg
-      inlineVolume: false,        // no inline volume = no opusscript dependency
+      inputType: StreamType.Raw,
+      inlineVolume: false,
     });
 
-    ffmpegProc.on('close', () => { try { unlinkSync(playFile); } catch {} });
-    ffmpegProc.on('error', reject);
-
-    // Use a one-shot flag so the persistent Idle handler and this promise
-    // don't both try to advance the queue (race condition that causes stuck queue).
+    // settled flag: only the first of Idle or error wins
     let settled = false;
-    const onIdle = () => {
+    const done = (err) => {
       if (settled) return;
       settled = true;
-      resolve();
+      // Clean up the listeners we registered
+      state.player.off(AudioPlayerStatus.Idle, onIdle);
+      state.player.off('error', onErr);
+      if (err) reject(err); else resolve();
     };
-    const onError = (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    };
+    const onIdle = () => done(null);
+    const onErr  = (e)  => done(e);
 
-    state.player.once(AudioPlayerStatus.Idle, onIdle);
-    state.player.once('error', onError);
+    state.player.once(AudioPlayerStatus.Idle,  onIdle);
+    state.player.once('error', onErr);
+
+    ffmpegProc.on('error', (e) => done(e));
 
     state.player.play(resource);
     console.log('[TTS] player.play() called (Raw PCM via ffmpeg)');
@@ -242,12 +237,10 @@ function playMP3(state, mp3Buffer) {
 }
 
 // ── Keep-alive silence to prevent Railway UDP timeout ──────────────────────
-// Discord kicks bots after ~60s of silence. We play 0.2s of silent audio
-// every 45s to keep the UDP connection alive on Railway.
 function startKeepAlive(state) {
   stopKeepAlive(state);
   state.keepAliveInterval = setInterval(() => {
-    if (state.active || state.connectionDead) return;
+    if (state.draining || state.connectionDead) return;
     try {
       const proc = spawn(FFMPEG, [
         '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
@@ -281,9 +274,6 @@ async function buildConnection(guildId, voiceChannelId, adapterCreator) {
     selfMute:        false,
   });
 
-  // Railway: UDP negotiation is slow/unreliable.
-  // Wait for Signalling (Discord WebSocket ACK only — no UDP needed),
-  // then sleep to let UDP finish in background before we play audio.
   try {
     await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
     console.log('[TTS] Signalling state reached ✅');
@@ -292,7 +282,6 @@ async function buildConnection(guildId, voiceChannelId, adapterCreator) {
     throw new Error('Could not reach Discord voice gateway — check bot Connect + Speak permissions');
   }
 
-  // Let Railway UDP settle before first audio
   await new Promise(r => setTimeout(r, 2500));
   console.log('[TTS] Connection ready (post-sleep) ✅');
   return connection;
@@ -314,14 +303,14 @@ function attachConnHandlers(connection, guildId) {
       console.warn('[TTS] Auto-reconnect failed — marking dead for rejoin');
       try { connection.destroy(); } catch {}
       const s = ttsState.get(guildId);
-      if (s) { s.connectionDead = true; s.active = false; }
+      if (s) { s.connectionDead = true; }
     }
   });
 
   connection.on(VoiceConnectionStatus.Destroyed, () => {
     console.warn('[TTS] Connection destroyed — queued messages will trigger rejoin');
     const s = ttsState.get(guildId);
-    if (s) { s.connectionDead = true; s.active = false; }
+    if (s) { s.connectionDead = true; }
   });
 }
 
@@ -348,7 +337,6 @@ async function rejoinVC(state, guildId) {
 async function getAIResponse(state, userText, username) {
   if (!groq) return null;
 
-  // Maintain per-guild conversation history (last 10 turns)
   if (!state.aiHistory) state.aiHistory = [];
 
   state.aiHistory.push({ role: 'user', content: `${username}: ${userText}` });
@@ -357,7 +345,7 @@ async function getAIResponse(state, userText, username) {
   try {
     const completion = await groq.chat.completions.create({
       model:      'llama-3.3-70b-versatile',
-      max_tokens: 120, // keep TTS short
+      max_tokens: 120,
       messages: [
         {
           role: 'system',
@@ -383,35 +371,53 @@ Keep responses concise, helpful, and conversational. You know about Hypixel Skyb
   }
 }
 
-// ── Process TTS queue ──────────────────────────────────────────────────────
-async function processQueue(guildId) {
+// ── Process TTS queue — SINGLETON DRAIN LOOP ───────────────────────────────
+// Only one drain loop runs per guild at a time.
+// `state.draining` holds the active Promise (or null).
+// Any call while draining is already running is a no-op — the running loop
+// will pick up any newly pushed items because it checks queue.length each iteration.
+function kickDrain(guildId) {
   const state = ttsState.get(guildId);
-  // active flag prevents concurrent processQueue calls from racing
-  if (!state || state.active) return;
+  if (!state) return;
 
-  // Drain the entire queue in a loop — no re-entrant scheduling needed
+  // Already draining — the loop will pick up new items automatically
+  if (state.draining) return;
+
+  // Start a new drain loop and store the promise so re-entrant calls skip it
+  state.draining = _drainLoop(guildId).finally(() => {
+    const s = ttsState.get(guildId);
+    if (s) s.draining = null;
+  });
+}
+
+async function _drainLoop(guildId) {
+  const state = ttsState.get(guildId);
+  if (!state) return;
+
   while (state.queue.length) {
-    // Rejoin if connection died
+    // Rejoin if connection died before attempting to speak
     if (state.connectionDead) {
       const ok = await rejoinVC(state, guildId);
-      if (!ok) break; // can't rejoin, stop draining
+      if (!ok) {
+        console.error('[TTS] Cannot rejoin — stopping drain');
+        break;
+      }
     }
 
-    state.active = true;
-    const { text, isAI, username } = state.queue.shift();
+    const item = state.queue.shift();
+    if (!item) continue;
 
+    const { text, isAI, username } = item;
     console.log(`[TTS] Speaking: "${text.slice(0, 80)}"`);
 
     try {
       let finalText = text;
 
-      // AI mode: get Groq response first
       if (isAI && state.aiMode && groq) {
         const aiReply = await getAIResponse(state, text, username);
         if (aiReply) {
           finalText = aiReply;
           console.log(`[TTS] AI reply: "${aiReply.slice(0, 80)}"`);
-          // Also send reply to text channel
           try {
             const ch = state.client?.channels?.cache?.get(state.textChannelId);
             if (ch) await ch.send(`🤖 **TITAN Jr.:** ${aiReply}`);
@@ -420,32 +426,25 @@ async function processQueue(guildId) {
       }
 
       const mp3Buffer = await synthesize(finalText);
+
+      // Re-check state after async synthesize — may have been stopped
+      if (!ttsState.has(guildId)) break;
+
       await playMP3(state, mp3Buffer);
 
     } catch (err) {
-      console.error('[TTS] processQueue error:', err.message);
+      console.error('[TTS] Drain error:', err.message);
+      // Small cooldown on error before trying next item
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    state.active = false;
-
-    // Small gap between messages
+    // Brief gap between messages
     if (state.queue.length) await new Promise(r => setTimeout(r, 200));
   }
-
-  // Ensure active is always cleared when we exit the loop
-  if (state) state.active = false;
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-/**
- * Setup TTS — bot joins VC and starts reading text channel
- * @param {Guild} guild
- * @param {string} voiceChannelId
- * @param {string} textChannelId
- * @param {boolean} aiMode - if true, messages get Groq AI responses
- * @param {Client} client - Discord client (needed for AI text channel replies)
- */
 export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = false, client = null) {
   // Cleanup any existing session
   const old = ttsState.get(guild.id);
@@ -468,7 +467,7 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
     player,
     connection,
     queue:          [],
-    active:         false,
+    draining:       null,   // Promise | null — the active drain loop
     textChannelId,
     voiceChannelId,
     adapterCreator: guild.voiceAdapterCreator,
@@ -480,18 +479,11 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
   };
   ttsState.set(guild.id, state);
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    // active flag is managed inside processQueue's drain loop.
-    // This handler only needs to handle the case where playMP3's once(Idle)
-    // already resolved — so we do nothing extra here to avoid double-trigger.
-  });
-  player.on(AudioPlayerStatus.Playing, () => console.log('[TTS] Player playing ✅'));
+  // Player error handler — log only; drain loop handles recovery
   player.on('error', err => {
     console.error('[TTS] Player error:', err.message);
-    state.active = false;
-    // Attempt to continue queue after error
-    setTimeout(() => processQueue(guild.id), 500);
   });
+  player.on(AudioPlayerStatus.Playing, () => console.log('[TTS] Player playing ✅'));
 
   attachConnHandlers(connection, guild.id);
   startKeepAlive(state);
@@ -499,13 +491,6 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
   return state;
 }
 
-/**
- * Enqueue a message to be spoken
- * @param {Guild} guild
- * @param {string} rawText
- * @param {string} username
- * @param {boolean} isAI - if true and aiMode enabled, sends to Groq first
- */
 export async function enqueueTTS(guild, rawText, username, isAI = false) {
   const state = ttsState.get(guild.id);
   if (!state) return false;
@@ -524,11 +509,11 @@ export async function enqueueTTS(guild, rawText, username, isAI = false) {
 
   if (!text || text.length > 450) return false;
 
-  // In normal mode, prefix with username
   const spokenText = isAI ? text : `${username} says, ${text}`;
   state.queue.push({ text: spokenText, isAI, username });
 
-  if (!state.active) processQueue(guild.id);
+  // Always kick — kickDrain is a no-op if already running
+  kickDrain(guild.id);
   return true;
 }
 
@@ -537,7 +522,6 @@ export function stopTTS(guildId) {
   if (!s) return;
   stopKeepAlive(s);
   s.queue  = [];
-  s.active = false;
   try { s.player.stop(true); } catch {}
   try { s.connection.destroy(); } catch {}
   ttsState.delete(guildId);
@@ -545,7 +529,7 @@ export function stopTTS(guildId) {
 
 export function clearTTSQueue(guildId) {
   const s = ttsState.get(guildId);
-  if (s) { s.queue = []; s.active = false; }
+  if (s) { s.queue = []; }
 }
 
 export function getTTSState(guildId) {
@@ -556,7 +540,7 @@ export function setAIMode(guildId, enabled) {
   const s = ttsState.get(guildId);
   if (s) {
     s.aiMode    = enabled;
-    s.aiHistory = []; // reset history on mode toggle
+    s.aiHistory = [];
   }
 }
 
@@ -567,11 +551,11 @@ export async function moveTTS(guild, newVcId) {
     const newConn = await buildConnection(guild.id, newVcId, guild.voiceAdapterCreator);
     stopKeepAlive(s);
     try { s.connection.destroy(); } catch {}
-    s.connection    = newConn;
+    s.connection     = newConn;
     s.voiceChannelId = newVcId;
     newConn.subscribe(s.player);
     attachConnHandlers(newConn, guild.id);
     startKeepAlive(s);
     return true;
   } catch { return false; }
-}
+          }
