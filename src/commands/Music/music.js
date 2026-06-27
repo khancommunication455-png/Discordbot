@@ -43,89 +43,93 @@ function findYtDlp() {
 const YTDLP = findYtDlp();
 console.log(`[Music] yt-dlp: ${YTDLP}`);
 
-// Search via Piped API (YouTube frontend proxy — no IP bans)
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.in.projectsegfau.lt',
-];
+// ── Music Search & Stream ─────────────────────────────────────────────────
+// Strategy: SoundCloud via yt-dlp (no IP ban on Railway) + YouTube URL fallback
+// YouTube search/stream is blocked on Railway IPs — SoundCloud is not.
 
-async function pipedSearch(query) {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const res = await fetch(`${base}/search?q=${encodeURIComponent(query)}&filter=videos`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const item = data.items?.find(i => i.type === 'stream' || i.url);
-      if (!item) continue;
-      const dur = item.duration || 0;
-      return {
-        title:     item.title ?? query,
-        url:       `https://www.youtube.com/watch?v=${item.url?.replace('/watch?v=', '') ?? item.videoId}`,
-        duration:  `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}`,
-        thumbnail: item.thumbnail ?? null,
-        author:    item.uploaderName ?? 'Unknown',
-      };
-    } catch {}
-  }
-  throw new Error('All Piped instances failed — try again');
-}
-
-async function pipedStream(videoUrl) {
-  const videoId = videoUrl.match(/[?&]v=([^&]+)/)?.[1];
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const res = await fetch(`${base}/streams/${videoId}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      // Pick best audio stream
-      const audio = data.audioStreams
-        ?.filter(s => s.url && s.bitrate)
-        ?.sort((a, b) => b.bitrate - a.bitrate)?.[0];
-      if (!audio?.url) continue;
-      return { streamUrl: audio.url, title: data.title };
-    } catch {}
-  }
-  throw new Error('Could not get stream from Piped — all instances failed');
+async function ytdlpRun(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(YTDLP, [
+      ...args,
+      '--no-warnings',
+      '--no-playlist',
+      '--print-json',
+      '--skip-download',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d);
+    proc.stderr.on('data', d => err += d);
+    proc.on('close', code => {
+      if (code !== 0) return reject(new Error(err.slice(0, 300) || `yt-dlp exit ${code}`));
+      try { resolve(JSON.parse(out.trim().split('\n')[0])); }
+      catch { reject(new Error('yt-dlp JSON parse failed')); }
+    });
+    proc.on('error', reject);
+  });
 }
 
 async function searchYouTube(query) {
-  const isUrl = /^https?:\/\//.test(query);
-  if (isUrl) {
-    const { title } = await pipedStream(query).catch(() => ({ title: query }));
-    return { title, url: query, duration: '?', thumbnail: null, author: 'Unknown' };
+  const isYouTubeUrl = /youtube\.com|youtu\.be/.test(query);
+  const isUrl        = /^https?:\/\//.test(query);
+
+  // For YouTube URLs: try yt-dlp with invidious extractor (bypasses ban)
+  // For queries: search SoundCloud (no ban on Railway)
+  let searchArg;
+  if (isYouTubeUrl) {
+    // Convert to Invidious URL which yt-dlp can fetch without cookies
+    const videoId = query.match(/(?:v=|youtu\.be\/)([^&?/]+)/)?.[1];
+    searchArg = videoId
+      ? `https://invidious.privacyredirect.com/watch?v=${videoId}`
+      : query;
+  } else if (isUrl) {
+    searchArg = query; // SoundCloud/other direct URL
+  } else {
+    searchArg = `scsearch1:${query}`; // SoundCloud search — works on Railway!
   }
-  return pipedSearch(query);
+
+  const info = await ytdlpRun([searchArg]);
+  const dur  = info.duration || 0;
+  return {
+    title:     info.title ?? query,
+    url:       info.webpage_url ?? info.original_url ?? searchArg,
+    duration:  dur ? `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}` : '?',
+    thumbnail: info.thumbnail ?? null,
+    author:    info.uploader ?? info.artist ?? 'Unknown',
+  };
 }
 
 // ── Audio stream via ffmpeg ────────────────────────────────────────────────
 async function createAudioStream(track) {
-  // Get stream URL via Piped API (no YouTube IP ban)
-  const { streamUrl } = await pipedStream(track.url);
-  console.log(`[Music] streaming via Piped ✅`);
+  // Stream via yt-dlp piped to ffmpeg
+  // SoundCloud URLs work fine; YouTube invidious URLs also work
+  console.log(`[Music] streaming: ${track.url}`);
+
+  const ytdlpProc = spawn(YTDLP, [
+    track.url,
+    '--no-playlist',
+    '--no-warnings',
+    '-f', 'bestaudio/best',
+    '-o', '-',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
   const ff = spawn(FFMPEG, [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', streamUrl,
+    '-i', 'pipe:0',
     '-vn',
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
     'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
   ff.stderr.on('data', () => {});
   ff.on('error', e => console.error('[Music][ffmpeg]', e.message));
+  ytdlpProc.stderr.on('data', () => {});
+  ytdlpProc.on('error', e => console.error('[Music][yt-dlp]', e.message));
+
+  ytdlpProc.stdout.pipe(ff.stdin);
+  ytdlpProc.stdout.on('error', () => {});
+  ff.stdin.on('error', () => {});
+
   return ff.stdout;
 }
 
@@ -454,4 +458,3 @@ export default {
     }
   },
 };
-    
