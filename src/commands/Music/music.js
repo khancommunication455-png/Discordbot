@@ -131,18 +131,35 @@ const musicState = new Map();
 
 async function playNext(guildId) {
   const state = musicState.get(guildId);
-  if (!state) return;
+  // Guard: state was cleaned up (connection destroyed) or already playing
+  if (!state || state.playing) return;
 
   if (!state.queue.length) {
     state.current = null;
     return;
   }
 
+  // Guard: connection is gone — don't attempt to play
+  if (!state.connection || state.connectionDead) {
+    console.warn('[Music] playNext skipped — connection is dead');
+    return;
+  }
+
   const track  = state.queue.shift();
   state.current = track;
+  state.playing = true;
 
   try {
     const stream   = await createAudioStream(track);
+
+    // Re-check state after async stream fetch (connection may have died)
+    const s = musicState.get(guildId);
+    if (!s || s.connectionDead) {
+      console.warn('[Music] playNext aborted — connection died during stream fetch');
+      state.playing = false;
+      return;
+    }
+
     const resource = createAudioResource(stream, {
       inputType: StreamType.Raw,   // Raw PCM — no opusscript needed
       inlineVolume: false,
@@ -152,6 +169,7 @@ async function playNext(guildId) {
   } catch (err) {
     console.error('[Music] playNext error:', err.message);
     state.current = null;
+    state.playing = false;
     setTimeout(() => playNext(guildId), 1000);
   }
 }
@@ -182,6 +200,8 @@ async function getOrCreateState(guild, voiceChannel) {
     voiceChannelId: voiceChannel.id,
     volume:        0.8,
     loop:          false,
+    playing:       false,
+    connectionDead: false,
   };
   musicState.set(guild.id, state);
 
@@ -189,12 +209,15 @@ async function getOrCreateState(guild, voiceChannel) {
   player.on(AudioPlayerStatus.Idle, () => {
     const s = musicState.get(guild.id);
     if (!s) return;
+    s.playing = false;
     if (s.loop && s.current) s.queue.unshift({ ...s.current });
     setTimeout(() => playNext(guild.id), 500);
   });
 
   player.on('error', err => {
     console.error('[Music] Player error:', err.message);
+    const s = musicState.get(guild.id);
+    if (s) s.playing = false;
     setTimeout(() => playNext(guild.id), 1000);
   });
 
@@ -216,6 +239,8 @@ async function getOrCreateState(guild, voiceChannel) {
 
   connection.on(VoiceConnectionStatus.Destroyed, () => {
     console.warn('[Music] Connection destroyed');
+    const s = musicState.get(guild.id);
+    if (s) s.connectionDead = true;
     musicState.delete(guild.id);
   });
 
