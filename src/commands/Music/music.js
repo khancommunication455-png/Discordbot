@@ -77,24 +77,42 @@ async function searchYouTube(query) {
 }
 
 // ── Audio stream via ffmpeg ────────────────────────────────────────────────
+// Pass the CDN URL directly to ffmpeg to avoid ytdl's undici dispatcher,
+// which throws "invalid onError method" when its request handler is torn down.
 async function createAudioStream(track) {
-  const info   = track.info ?? await ytdl.getInfo(track.url);
-  const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+  let info;
+  try {
+    info = track.info ?? await ytdl.getInfo(track.url);
+  } catch (e) {
+    throw new Error(`ytdl.getInfo failed: ${e.message}`);
+  }
+
+  let format;
+  try {
+    format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+  } catch {
+    format = ytdl.chooseFormat(info.formats, { quality: 'lowestaudio' });
+  }
+
+  if (!format?.url) throw new Error('No playable audio format found');
 
   const ff = spawn(FFMPEG, [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
+    '-reconnect',           '1',
+    '-reconnect_streamed',  '1',
     '-reconnect_delay_max', '5',
+    '-headers', 'User-Agent: Mozilla/5.0\r\nOrigin: https://www.youtube.com\r\nReferer: https://www.youtube.com/\r\n',
     '-i', format.url,
     '-vn',
-    '-f', 's16le',
+    '-f',  's16le',
     '-ar', '48000',
     '-ac', '2',
     'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
   ff.stderr.on('data', () => {});
-  ff.on('error', e => console.error('[Music][ffmpeg]', e.message));
+  ff.on('error', e => { console.error('[Music][ffmpeg spawn]', e.message); ff.stdout.destroy(e); });
+  ff.on('close', code => { if (code !== 0 && code !== null) console.warn(`[Music][ffmpeg] exit ${code}`); });
+
   return ff.stdout;
 }
 
