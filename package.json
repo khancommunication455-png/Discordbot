@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "deploy": "node src/deploy-commands.js"
+    "deploy": "node src/deploy-commands.js",
+    "postinstall": "cp node_modules/libsodium/dist/modules-esm/libsodium.mjs node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs 2>/dev/null || true"
   },
   "dependencies": {
     "@discordjs/rest": "^2.4.0",
