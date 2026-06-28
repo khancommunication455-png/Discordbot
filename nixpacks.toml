@@ -1,15 +1,25 @@
+# ─────────────────────────────────────────────────────────────
+# SkyBot v2 — Railway Nixpacks Config
+# ─────────────────────────────────────────────────────────────
+# Key change from v1: NO Python venv, NO edge-tts binary.
+# All TTS is done via pure HTTP (Google TTS / StreamElements / VoiceRSS)
+# and encoded to opus using @discordjs/voice's built-in prism-media
+# (FFmpeg transcoder). This removes the #1 cause of Railway TTS failures.
+# yt-dlp is installed via nix so /music and /download work without any
+# runtime pip install or binary download.
+# ─────────────────────────────────────────────────────────────
+
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python313"]
+nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp"]
 
 [variables]
-PATH = "/app/venv/bin:$NIXPACKS_PATH"
+NODE_ENV = "production"
 
 [phases.install]
-cmds = [
-  "python3 -m venv /app/venv && /app/venv/bin/pip install edge-tts yt-dlp -U -q",
-  "npm install",
-  "node -e \"const fs=require('fs');try{fs.copyFileSync('node_modules/libsodium/dist/modules-esm/libsodium.mjs','node_modules/libsodium-wrappers/dist/modules-esm/libsodium.mjs');console.log('[sodium] patched');}catch(e){console.log('[sodium] skip:',e.message);}\""
-]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = ["echo 'No build step needed for SkyBot v2'"]
 
 [start]
 cmd = "node src/index.js"

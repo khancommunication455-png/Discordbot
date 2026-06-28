@@ -1,9 +1,22 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+/**
+ * economy.js — SkyBot v2 Economy command
+ *
+ * Ported from SkyBot v1 (Discordbot-main/src/commands/Economy/economy.js).
+ * Adapted for v2 flat db (db.economy, db.premiumUsers), SkyBot v2 footer,
+ * and cooldown: 3.
+ *
+ * Subcommands:
+ *   User:   /economy balance, /economy daily, /economy work, /economy crime,
+ *           /economy deposit, /economy withdraw, /economy pay, /economy rob,
+ *           /economy gamble, /economy leaderboard
+ *   Admin:  /economy add, /economy reset
+ */
+import { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { getEconomy, saveEconomy, formatMoney, formatDuration } from '../../utils/economy.js';
 import { C } from '../../utils/embeds.js';
 import { getDb } from '../../utils/db.js';
 
-const FOOTER   = { text: 'TITAN Jr. Economy' };
+const FOOTER   = { text: 'SkyBot v2 • Railway Edition' };
 const DAILY    = 1000;
 const DAILY_CD = 86_400_000;
 const WORK_CD  = 3_600_000;
@@ -31,6 +44,8 @@ function e(color, title, desc, fields = []) {
 }
 
 export default {
+  cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('economy')
     .setDescription('Economy system — earn, spend and manage coins')
@@ -68,7 +83,22 @@ export default {
       .setDescription('Bet coins — 55% chance to double your bet')
       .addIntegerOption(o => o.setName('amount').setDescription('Amount to gamble').setRequired(true).setMinValue(10))
     )
-    .addSubcommand(s => s.setName('leaderboard').setDescription('Top 10 richest users in this server')),
+    .addSubcommand(s => s.setName('leaderboard').setDescription('Top 10 richest users in this server'))
+    // ── Admin subcommands ──
+    .addSubcommand(s => s
+      .setName('add')
+      .setDescription('Add coins to a user (Admin only)')
+      .addUserOption(o => o.setName('user').setDescription('Target user').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to add').setRequired(true).setMinValue(1))
+      .addStringOption(o => o
+        .setName('where').setDescription('Wallet or bank').setRequired(false)
+        .addChoices({ name: 'Wallet', value: 'wallet' }, { name: 'Bank', value: 'bank' }))
+    )
+    .addSubcommand(s => s
+      .setName('reset')
+      .setDescription('Reset a user\'s economy (Admin only)')
+      .addUserOption(o => o.setName('user').setDescription('Target user').setRequired(true))
+    ),
 
   async execute(interaction, client) {
     const sub     = interaction.options.getSubcommand();
@@ -78,10 +108,10 @@ export default {
 
     // ── BALANCE ──────────────────────────────────────────────────────
     if (sub === 'balance') {
-      const target = interaction.options.getUser('user') ?? interaction.user;
-      const d      = getEconomy(guildId, target.id);
-      const total  = (d.wallet ?? 0) + (d.bank ?? 0);
-      const bankPct = Math.round(((d.bank ?? 0) / BANK_CAP) * 100);
+      const target  = interaction.options.getUser('user') ?? interaction.user;
+      const d       = getEconomy(guildId, target.id);
+      const total   = (d.wallet ?? 0) + (d.bank ?? 0);
+      const bankPct = Math.min(100, Math.round(((d.bank ?? 0) / BANK_CAP) * 100));
 
       return interaction.reply({
         embeds: [new EmbedBuilder()
@@ -110,7 +140,7 @@ export default {
         });
       }
       const db       = getDb();
-      const isPrem   = db.data.premiumUsers.includes(uid);
+      const isPrem   = (db.premiumUsers ?? []).includes(uid);
       const amount   = isPrem ? Math.floor(DAILY * 1.5) : DAILY;
       const streak   = (d.streak ?? 0) + 1;
       const bonus    = streak >= 7 ? Math.floor(amount * 0.1) : 0;
@@ -123,10 +153,10 @@ export default {
           .setColor(C.economy)
           .setTitle('Daily Reward Claimed')
           .addFields(
-            { name: 'Reward',    value: formatMoney(amount),                              inline: true },
-            { name: 'Streak',    value: `${streak} day${streak !== 1 ? 's' : ''}`,       inline: true },
-            { name: 'Bonus',     value: bonus > 0 ? `+${formatMoney(bonus)} 🔥` : 'None', inline: true },
-            { name: 'New Balance', value: `**${formatMoney(d.wallet)}**`,                 inline: false },
+            { name: 'Reward',     value: formatMoney(amount),                              inline: true },
+            { name: 'Streak',     value: `${streak} day${streak !== 1 ? 's' : ''}`,        inline: true },
+            { name: 'Bonus',      value: bonus > 0 ? `+${formatMoney(bonus)} 🔥` : 'None', inline: true },
+            { name: 'New Balance', value: `**${formatMoney(d.wallet)}**`,                  inline: false },
           )
           .setDescription(isPrem ? '⭐ Premium bonus applied (+50%)' : streak >= 7 ? '🔥 7-day streak bonus!' : null)
           .setFooter(FOOTER).setTimestamp()
@@ -198,7 +228,7 @@ export default {
       const target = interaction.options.getUser('user');
       const amount = interaction.options.getInteger('amount');
       if (target.id === uid) return interaction.reply({ embeds: [e(C.error, 'Invalid', 'You cannot pay yourself.')], flags: [64] });
-      const sender   = getEconomy(guildId, uid);
+      const sender = getEconomy(guildId, uid);
       if ((sender.wallet ?? 0) < amount) return interaction.reply({ embeds: [e(C.error, 'Insufficient Funds', `You only have **${formatMoney(sender.wallet)}** in your wallet.`)], flags: [64] });
       const receiver = getEconomy(guildId, target.id);
       sender.wallet  -= amount; receiver.wallet = (receiver.wallet ?? 0) + amount;
@@ -259,7 +289,7 @@ export default {
     // ── LEADERBOARD ───────────────────────────────────────────────────
     if (sub === 'leaderboard') {
       const db     = getDb();
-      const users  = db.data.economy[guildId] ?? {};
+      const users  = db.economy?.[guildId] ?? {};
       const sorted = Object.entries(users)
         .map(([id, d]) => ({ id, total: (d.wallet ?? 0) + (d.bank ?? 0) }))
         .sort((a, b) => b.total - a.total)
@@ -277,6 +307,42 @@ export default {
           .setDescription(lines.join('\n') || 'No data yet.')
           .setFooter(FOOTER).setTimestamp()
         ],
+      });
+    }
+
+    // ── ADD (Admin) ───────────────────────────────────────────────────
+    if (sub === 'add') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return interaction.reply({ embeds: [e(C.error, 'No Permission', 'You need **Manage Server** permission to use this command.')], flags: [64] });
+      }
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+      const where  = interaction.options.getString('where') ?? 'wallet';
+      const d      = getEconomy(guildId, target.id);
+      if (where === 'bank') d.bank   = (d.bank   ?? 0) + amount;
+      else                  d.wallet = (d.wallet ?? 0) + amount;
+      d.totalEarned = (d.totalEarned ?? 0) + amount;
+      await saveEconomy(guildId, target.id, d);
+      return interaction.reply({
+        embeds: [e(C.success, 'Coins Added', `Added **${formatMoney(amount)}** to **${target.username}**'s ${where}.\nNew ${where} balance: **${formatMoney(where === 'bank' ? d.bank : d.wallet)}**`)],
+        flags: [64],
+      });
+    }
+
+    // ── RESET (Admin) ─────────────────────────────────────────────────
+    if (sub === 'reset') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return interaction.reply({ embeds: [e(C.error, 'No Permission', 'You need **Manage Server** permission to use this command.')], flags: [64] });
+      }
+      const target = interaction.options.getUser('user');
+      await saveEconomy(guildId, target.id, {
+        wallet: 0, bank: 0,
+        lastDaily: 0, lastWork: 0, lastCrime: 0, lastRob: 0,
+        inventory: [], totalEarned: 0,
+      });
+      return interaction.reply({
+        embeds: [e(C.warning, 'Economy Reset', `**${target.username}**'s economy has been reset to zero.`)],
+        flags: [64],
       });
     }
   },

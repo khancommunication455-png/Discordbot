@@ -1,18 +1,21 @@
 /**
- * /profile — Full SkyCrypt-accurate Skyblock profile viewer
- * Ported from SkyCrypt-development source (skills, dungeons, slayer, weight)
- * Uses real XP tables, level caps, and stat formulas
+ * profile.js — Full SkyCrypt-accurate Skyblock profile viewer
+ *
+ * Ported from SkyCrypt-development source (skills, dungeons, slayer, weight).
+ * Uses real XP tables, level caps, and stat formulas.
+ *
+ * Pages: Overview / Skills / Dungeons / Slayers / Mining
+ * Navigation via 5-button row. 5-min inactivity timeout.
  */
 import {
   SlashCommandBuilder, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder,
 } from 'discord.js';
 import {
   getUUID, getActiveProfile, getSkyblockProfiles, getPlayerData, cleanItemName,
 } from '../../services/hypixel.js';
 import { getDb } from '../../utils/db.js';
-import { errorEmbed, formatCoins } from '../../utils/embeds.js';
+import { C, errorEmbed, formatCoins } from '../../utils/embeds.js';
 import {
   getLevelByXp, getSlayerLevel, progressBar, formatXP,
   DEFAULT_SKILL_CAPS, COSMETIC_SKILLS, SLAYER_NAMES, DUNGEONEERING_XP,
@@ -101,7 +104,7 @@ function calcDungeons(member) {
   });
 
   // Floors
-  function parseFloors(type, data) {
+  function parseFloors(data) {
     if (!data) return {};
     const floors = {};
     const tierCompletions = data.tier_completions ?? {};
@@ -139,8 +142,8 @@ function calcDungeons(member) {
     cataLevel,
     highestFloor: cata?.highest_tier_completed ?? 0,
     highestMasterFloor: master?.highest_tier_completed ?? 0,
-    cataFloors: parseFloors('catacombs', cata),
-    masterFloors: parseFloors('master_catacombs', master),
+    cataFloors: parseFloors(cata),
+    masterFloors: parseFloors(master),
     classes,
     selectedClass,
     essence,
@@ -229,7 +232,7 @@ function buildOverviewEmbed(ign, uuid, profileName, rank, sb, skills, dungeons, 
   }).join('\n') || 'No slayers';
 
   return new EmbedBuilder()
-    .setColor(0x00b4d8)
+    .setColor(C.carry)
     .setAuthor({ name: `${rankLabel}${ign}`, iconURL: `https://mc-heads.net/avatar/${uuid}/32` })
     .setTitle(`📊 ${profileName} — Overview`)
     .setThumbnail(`https://mc-heads.net/body/${uuid}/right`)
@@ -265,7 +268,7 @@ function buildOverviewEmbed(ign, uuid, profileName, rank, sb, skills, dungeons, 
         inline: false,
       },
     )
-    .setFooter({ text: `SkyBot • Powered by Hypixel API${skills.skills.farming?.apiOff ? ' • *API off (achievement fallback)' : ''}` })
+    .setFooter({ text: `SkyBot v2 • Powered by Hypixel API${skills.skills.farming?.apiOff ? ' • *API off (achievement fallback)' : ''}` })
     .setTimestamp();
 }
 
@@ -279,7 +282,7 @@ function buildSkillsEmbed(ign, uuid, profileName, skills) {
   });
 
   return new EmbedBuilder()
-    .setColor(0x57f287)
+    .setColor(C.success)
     .setAuthor({ name: ign, iconURL: `https://mc-heads.net/avatar/${uuid}/32` })
     .setTitle(`🎯 ${profileName} — Skills`)
     .setDescription(lines.join('\n\n'))
@@ -287,13 +290,13 @@ function buildSkillsEmbed(ign, uuid, profileName, skills) {
       { name: 'Skill Average', value: `**${skills.avgSkill.toFixed(2)}**`, inline: true },
       { name: 'Total Skill XP', value: formatXP(skills.totalXp), inline: true },
     )
-    .setFooter({ text: 'SkyBot • SkyCrypt-accurate XP tables' })
+    .setFooter({ text: 'SkyBot v2 • SkyCrypt-accurate XP tables' })
     .setTimestamp();
 }
 
 function buildDungeonsEmbed(ign, uuid, profileName, dungeons) {
   if (!dungeons) {
-    return new EmbedBuilder().setColor(0xed4245).setTitle('No dungeon data found.').setTimestamp();
+    return new EmbedBuilder().setColor(C.error).setTitle('No dungeon data found.').setTimestamp();
   }
 
   const { cataLevel, cataFloors, masterFloors, classes, selectedClass, essence } = dungeons;
@@ -318,7 +321,7 @@ function buildDungeonsEmbed(ign, uuid, profileName, dungeons) {
     .join(' | ') || 'None';
 
   return new EmbedBuilder()
-    .setColor(0x9b59b6)
+    .setColor(C.leveling)
     .setAuthor({ name: ign, iconURL: `https://mc-heads.net/avatar/${uuid}/32` })
     .setTitle(`⚔️ ${profileName} — Dungeons`)
     .addFields(
@@ -332,7 +335,7 @@ function buildDungeonsEmbed(ign, uuid, profileName, dungeons) {
       { name: 'Classes',       value: classLines, inline: false },
       { name: 'Essence',       value: essenceLines, inline: false },
     )
-    .setFooter({ text: 'SkyBot • SkyCrypt-accurate dungeon data' })
+    .setFooter({ text: 'SkyBot v2 • SkyCrypt-accurate dungeon data' })
     .setTimestamp();
 }
 
@@ -357,12 +360,12 @@ function buildSlayerEmbed(ign, uuid, profileName, slayers) {
   if (!fields.length) fields.push({ name: 'No Slayers', value: 'No slayer data found.', inline: false });
 
   return new EmbedBuilder()
-    .setColor(0xed4245)
+    .setColor(C.error)
     .setAuthor({ name: ign, iconURL: `https://mc-heads.net/avatar/${uuid}/32` })
     .setTitle(`🗡️ ${profileName} — Slayers`)
     .addFields(...fields)
     .addFields({ name: 'Total Slayer XP', value: formatXP(slayers.totalXp), inline: true })
-    .setFooter({ text: 'SkyBot • SkyCrypt-accurate slayer data' })
+    .setFooter({ text: 'SkyBot v2 • SkyCrypt-accurate slayer data' })
     .setTimestamp();
 }
 
@@ -376,20 +379,20 @@ function buildMiningEmbed(ign, uuid, profileName, member) {
   const nucleusRuns = member?.mining_core?.greater_mines_last_claimed ?? 0;
 
   return new EmbedBuilder()
-    .setColor(0x5865f2)
+    .setColor(C.info)
     .setAuthor({ name: ign, iconURL: `https://mc-heads.net/avatar/${uuid}/32` })
     .setTitle(`⛏️ ${profileName} — Mining / HoTM`)
     .addFields(
       {
         name: `HoTM Level ${hotm.level}`,
-        value: `${progressBar(hotm.progress, 12)} ${formatXP(hotm.xpCurrent)} / ${formatXP(hotm.xpForNext === Infinity ? 0 : hotm.xpForNext)} XP\nTokens Available: **${hotm.tokens}** | Spent: **${hotm.tokensSpent}**`,
+        value: `${progressBar(hotm.progress, 12)} ${formatXP(hotm.xpCurrent)} / ${formatXP(hotm.xpForNext === Infinity ? 0 : hotm.xpForNext)} XP\nTokens Available: **${hotm.tokens}** | Spent: **${hotm.tokensSpent}**\nNucleus Runs: **${nucleusRuns.toLocaleString()}**`,
         inline: false,
       },
       { name: '🟣 Mithril Powder',  value: `Available: **${mithril.toLocaleString()}**\nSpent: **${mithrilSpent.toLocaleString()}**`, inline: true },
       { name: '💎 Gemstone Powder', value: `Available: **${gemstone.toLocaleString()}**\nSpent: **${gemstoneSpent.toLocaleString()}**`, inline: true },
       { name: '❄️ Glacite Powder',   value: `**${glacite.toLocaleString()}**`, inline: true },
     )
-    .setFooter({ text: 'SkyBot' })
+    .setFooter({ text: 'SkyBot v2 • Mining' })
     .setTimestamp();
 }
 
@@ -414,6 +417,7 @@ export default {
          { name: 'Mining',    value: 'mining'    },
        )
     ),
+
   cooldown: 5,
 
   async execute(interaction, client) {
@@ -426,7 +430,7 @@ export default {
 
     // Resolve account
     if (!ign) {
-      const linked = db.data.linkedPlayers[interaction.user.id];
+      const linked = db.linkedPlayers?.[interaction.user.id];
       if (!linked) {
         return interaction.editReply({ embeds: [errorEmbed('Not Linked', 'Use `/link <ign>` first, or provide an IGN.')] });
       }
@@ -450,7 +454,7 @@ export default {
         return interaction.editReply({ embeds: [errorEmbed('No Profiles', `**${ign}** has no SkyBlock profiles.`)] });
       }
 
-      // Let user pick profile if multiple
+      // Active profile (selected or first)
       const activeProfile = profiles.find(p => p.selected) ?? profiles[0];
       const member        = activeProfile.members?.[uuid];
       if (!member) {

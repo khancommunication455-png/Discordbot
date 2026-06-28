@@ -1,17 +1,60 @@
+/**
+ * music.js — SkyBot v2 Music Player (yt-dlp powered, Railway-safe)
+ * =================================================================
+ *
+ * Subcommands: play, skip, stop, queue, pause, resume, loop, volume,
+ *              nowplaying, shuffle
+ *
+ * Key v2 changes from v1:
+ *   • @distube/ytdl-core replaced with the `yt-dlp` binary (auto-detected
+ *     from common Railway/Termux/Linux paths). yt-dlp is more reliable on
+ *     Railway (no native deps, no YouTube cipher breakage).
+ *   • State stored on `client.musicQueues` (Map) — set up in index.js.
+ *   • Per-guild volume + loop preferences persisted in `db.musicSettings`
+ *     (flat — no `db.data.xxx`).
+ *   • Audio stream: yt-dlp resolves bestaudio URL → ffmpeg spawns and
+ *     outputs raw s16le 48k stereo PCM → @discordjs/voice audio resource
+ *     (StreamType.Raw, inlineVolume:false — same Railway-safe pattern as
+ *     the TTS service).
+ *   • Voice connection: Railway-proof (wait for Signalling + 2.5s grace
+ *     sleep for UDP negotiation, auto-reconnect on Disconnected).
+ *   • Footer "SkyBot v2 • Railway Edition"; cooldown: 1.
+ */
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
   AudioPlayerStatus, VoiceConnectionStatus, StreamType,
   NoSubscriberBehavior, entersState,
 } from '@discordjs/voice';
-// ytdl replaced with yt-dlp to avoid Railway IP bans
-import { existsSync } from 'fs';           // ✅ only fs stuff from 'fs'
-import { execSync, spawn } from 'child_process'; // ✅ execSync from correct module
+import { spawn, execSync } from 'child_process';
+import { existsSync } from 'fs';
+import { getDb, saveDb } from '../../utils/db.js';
 import { C } from '../../utils/embeds.js';
 
-const FOOTER = { text: 'TITAN Jr. Music' };
+const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
 
-// ── Find ffmpeg ────────────────────────────────────────────────────────────
+// ── Locate yt-dlp binary ──────────────────────────────────────────────────
+function findYtDlp() {
+  for (const p of [
+    process.env.YTDLP_PATH,
+    '/root/.nix-profile/bin/yt-dlp',                // Railway nixpacks
+    '/nix/var/nix/profiles/default/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
+    '/usr/local/bin/yt-dlp',
+    '/root/.local/bin/yt-dlp',                       // pip user install
+    '/data/data/com.termux/files/usr/bin/yt-dlp',   // Termux
+    'yt-dlp',                                         // PATH fallback
+  ]) {
+    if (!p) continue;
+    try {
+      if (p === 'yt-dlp') { execSync('yt-dlp --version', { stdio: 'pipe', timeout: 5000 }); return p; }
+      if (existsSync(p)) return p;
+    } catch { /* ignore */ }
+  }
+  return 'yt-dlp';
+}
+
+// ── Locate ffmpeg binary ──────────────────────────────────────────────────
 function findFFmpeg() {
   for (const p of [
     process.env.FFMPEG_PATH,
@@ -23,146 +66,137 @@ function findFFmpeg() {
   ]) {
     if (!p) continue;
     try {
-      if (p === 'ffmpeg') { execSync('ffmpeg -version', { stdio: 'pipe' }); return p; }
+      if (p === 'ffmpeg') { execSync('ffmpeg -version', { stdio: 'pipe', timeout: 5000 }); return p; }
       if (existsSync(p)) return p;
-    } catch {}
+    } catch { /* ignore */ }
   }
   return 'ffmpeg';
 }
+
+const YTDLP  = findYtDlp();
 const FFMPEG = findFFmpeg();
-console.log(`[Music] ffmpeg: ${FFMPEG}`);
+console.log(`[Music] yt-dlp: ${YTDLP} | ffmpeg: ${FFMPEG}`);
 
-// ── YouTube search ─────────────────────────────────────────────────────────
-// Find yt-dlp binary
-function findYtDlp() {
-  for (const p of ['yt-dlp', '/root/.nix-profile/bin/yt-dlp', '/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp']) {
-    try { execSync(`${p} --version`, { stdio: 'pipe', timeout: 5000 }); return p; } catch {}
-  }
-  return 'yt-dlp';
-}
-const YTDLP = findYtDlp();
-console.log(`[Music] yt-dlp: ${YTDLP}`);
-
-// ── Music Search & Stream ─────────────────────────────────────────────────
-// Strategy: SoundCloud via yt-dlp (no IP ban on Railway) + YouTube URL fallback
-// YouTube search/stream is blocked on Railway IPs — SoundCloud is not.
-
-async function ytdlpRun(args) {
+// ── Spawn helper: capture stdout as string with timeout ───────────────────
+function spawnCapture(bin, args, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(YTDLP, [
-      ...args,
-      '--no-warnings',
-      '--no-playlist',
-      '--print-json',
-      '--skip-download',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    proc.stdout.on('data', d => out += d);
-    proc.stderr.on('data', d => err += d);
-    proc.on('close', code => {
-      if (code !== 0) return reject(new Error(err.slice(0, 300) || `yt-dlp exit ${code}`));
-      try { resolve(JSON.parse(out.trim().split('\n')[0])); }
-      catch { reject(new Error('yt-dlp JSON parse failed')); }
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+      reject(new Error(`${bin} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.stdout.on('data', (d) => { stdout += d; });
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
     });
-    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${bin} exited ${code}: ${stderr.slice(0, 300)}`));
+    });
   });
 }
 
-async function searchYouTube(query) {
-  const isYouTubeUrl = /youtube\.com|youtu\.be/.test(query);
-  const isUrl        = /^https?:\/\//.test(query);
+// ── Get video info via yt-dlp (URL or search query) ───────────────────────
+async function getVideoInfo(query) {
+  const isUrl = /^https?:\/\//.test(query);
+  // ytsearch1: lets yt-dlp resolve a plain text query to the first result.
+  const target = isUrl ? query : `ytsearch1:${query}`;
 
-  // For YouTube URLs: try yt-dlp with invidious extractor (bypasses ban)
-  // For queries: search SoundCloud (no ban on Railway)
-  let searchArg;
-  if (isYouTubeUrl) {
-    // Convert to Invidious URL which yt-dlp can fetch without cookies
-    const videoId = query.match(/(?:v=|youtu\.be\/)([^&?/]+)/)?.[1];
-    searchArg = videoId
-      ? `https://invidious.privacyredirect.com/watch?v=${videoId}`
-      : query;
-  } else if (isUrl) {
-    searchArg = query; // SoundCloud/other direct URL
-  } else {
-    searchArg = `scsearch1:${query}`; // SoundCloud search — works on Railway!
-  }
+  const json = await spawnCapture(
+    YTDLP,
+    ['-J', '--no-playlist', '--no-warnings', '--no-progress', target],
+    25_000,
+  );
+  const info = JSON.parse(json);
 
-  const info = await ytdlpRun([searchArg]);
-  const dur  = info.duration || 0;
+  // For search results, yt-dlp wraps the result in `entries[]`.
+  const v = info.entries && info.entries.length ? info.entries[0] : info;
+  const dur = parseInt(v.duration, 10) || 0;
+  const durationStr = v.duration_string
+    || (dur > 0 ? `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}` : 'LIVE');
+
+  const url = v.webpage_url
+    || v.original_url
+    || (v.id ? `https://www.youtube.com/watch?v=${v.id}` : query);
+
   return {
-    title:     info.title ?? query,
-    url:       info.webpage_url ?? info.original_url ?? searchArg,
-    duration:  dur ? `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}` : '?',
-    thumbnail: info.thumbnail ?? null,
-    author:    info.uploader ?? info.artist ?? 'Unknown',
+    title:     v.title || query,
+    url,
+    duration:  durationStr,
+    thumbnail: v.thumbnail || v.thumbnails?.slice(-1)[0]?.url || null,
+    author:    v.uploader || v.channel || v.uploader_id || 'Unknown',
   };
 }
 
-// ── Audio stream via ffmpeg ────────────────────────────────────────────────
-async function createAudioStream(track) {
-  // Stream via yt-dlp piped to ffmpeg
-  // SoundCloud URLs work fine; YouTube invidious URLs also work
-  console.log(`[Music] streaming: ${track.url}`);
+// ── Resolve direct audio URL via yt-dlp ───────────────────────────────────
+async function getAudioUrl(videoUrl) {
+  const out = await spawnCapture(
+    YTDLP,
+    ['-f', 'bestaudio', '-g', '--no-playlist', '--no-warnings', '--no-progress', videoUrl],
+    15_000,
+  );
+  return out.split('\n').map((s) => s.trim()).filter(Boolean)[0] || null;
+}
 
-  const ytdlpProc = spawn(YTDLP, [
-    track.url,
-    '--no-playlist',
-    '--no-warnings',
-    '-f', 'bestaudio/best',
-    '-o', '-',
+// ── Spawn ffmpeg → raw s16le 48k stereo PCM stream ────────────────────────
+function createAudioStream(audioUrl) {
+  const ff = spawn(FFMPEG, [
+    '-reconnect',         '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i',                 audioUrl,
+    '-vn',
+    '-f',                 's16le',   // raw signed 16-bit little-endian PCM
+    '-ar',                '48000',   // 48kHz required by Discord
+    '-ac',                '2',       // stereo
+    'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  const ff = spawn(FFMPEG, [
-    '-i', 'pipe:0',
-    '-vn',
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-    'pipe:1',
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-  ff.stderr.on('data', () => {});
-  ff.on('error', e => console.error('[Music][ffmpeg]', e.message));
-  ytdlpProc.stderr.on('data', () => {});
-  ytdlpProc.on('error', e => console.error('[Music][yt-dlp]', e.message));
-
-  ytdlpProc.stdout.pipe(ff.stdin);
-  ytdlpProc.stdout.on('error', () => {});
-  ff.stdin.on('error', () => {});
-
+  ff.stderr.on('data', () => { /* suppress */ });
+  ff.on('error', (e) => console.error('[Music][ffmpeg]', e.message));
   return ff.stdout;
 }
 
-// ── Voice connection (Railway-proof) ───────────────────────────────────────
-// Railway has strict UDP — waiting for Ready always times out.
-// Strategy: wait for Signalling (WebSocket only, no UDP), then sleep 2.5s.
+// ── Railway-proof voice connection ────────────────────────────────────────
+// Wait for Signalling (WebSocket-only, no UDP) then sleep 2.5s for UDP.
 async function buildConnection(guild, voiceChannelId) {
   const connection = joinVoiceChannel({
-    channelId:      voiceChannelId,
-    guildId:        guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf:       true,
+    channelId:        voiceChannelId,
+    guildId:          guild.id,
+    adapterCreator:   guild.voiceAdapterCreator,
+    selfDeaf:         true,
   });
 
   try {
     await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
     console.log('[Music] Signalling state reached ✅');
   } catch {
-    try { connection.destroy(); } catch {}
+    try { connection.destroy(); } catch { /* ignore */ }
     throw new Error('Could not connect to voice channel — check bot has Connect + Speak permissions');
   }
 
-  // Let Railway UDP negotiate in background before we push audio
-  await new Promise(r => setTimeout(r, 2500));
+  // Let Railway UDP negotiate in background before we push audio.
+  await new Promise((r) => setTimeout(r, 2500));
   console.log('[Music] Connection ready ✅');
   return connection;
 }
 
-// ── Per-guild music state ──────────────────────────────────────────────────
-const musicState = new Map();
-
-async function playNext(guildId) {
-  const state = musicState.get(guildId);
+// ── Per-guild music state lifecycle ───────────────────────────────────────
+async function playNext(client, guildId) {
+  const state = client.musicQueues.get(guildId);
   if (!state) return;
 
   if (!state.queue.length) {
@@ -170,67 +204,74 @@ async function playNext(guildId) {
     return;
   }
 
-  const track  = state.queue.shift();
+  const track = state.queue.shift();
   state.current = track;
 
   try {
-    const stream   = await createAudioStream(track);
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Raw,   // Raw PCM — no opusscript needed
-      inlineVolume: false,
+    const audioUrl = await getAudioUrl(track.url);
+    if (!audioUrl) throw new Error('yt-dlp returned no audio URL');
+
+    const resource = createAudioResource(createAudioStream(audioUrl), {
+      inputType:      StreamType.Raw,    // Raw PCM — no opusscript needed
+      inlineVolume:   false,             // CRITICAL: Railway-safe
     });
     state.player.play(resource);
     console.log(`[Music] Playing: ${track.title}`);
   } catch (err) {
     console.error('[Music] playNext error:', err.message);
     state.current = null;
-    setTimeout(() => playNext(guildId), 1000);
+    setTimeout(() => playNext(client, guildId), 1000);
   }
 }
 
-async function getOrCreateState(guild, voiceChannel) {
-  const existing = musicState.get(guild.id);
+async function getOrCreateState(client, guild, voiceChannel) {
+  const existing = client.musicQueues.get(guild.id);
 
-  // Already in the right VC — reuse
+  // Already in the right VC — reuse.
   if (existing && existing.voiceChannelId === voiceChannel.id) return existing;
 
-  // In wrong VC — tear down first
+  // In wrong VC — tear down first.
   if (existing) {
-    try { existing.player.stop(true); } catch {}
-    try { existing.connection.destroy(); } catch {}
-    await new Promise(r => setTimeout(r, 500));
-    musicState.delete(guild.id);
+    try { existing.player.stop(true); } catch { /* ignore */ }
+    try { existing.connection.destroy(); } catch { /* ignore */ }
+    await new Promise((r) => setTimeout(r, 500));
+    client.musicQueues.delete(guild.id);
   }
 
   const connection = await buildConnection(guild, voiceChannel.id);
   const player     = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   connection.subscribe(player);
 
+  // Load per-guild preferences from flat db.
+  const db = getDb();
+  if (!db.musicSettings) db.musicSettings = {};
+  const settings = db.musicSettings[guild.id] || { volume: 80, loop: false };
+
   const state = {
     connection,
     player,
-    queue:         [],
-    current:       null,
+    queue:          [],
+    current:        null,
     voiceChannelId: voiceChannel.id,
-    volume:        0.8,
-    loop:          false,
+    volume:         settings.volume ?? 80,
+    loop:           !!settings.loop,
   };
-  musicState.set(guild.id, state);
+  client.musicQueues.set(guild.id, state);
 
-  // ── Player events ────────────────────────────────────────────────────
+  // ── Player events ──
   player.on(AudioPlayerStatus.Idle, () => {
-    const s = musicState.get(guild.id);
+    const s = client.musicQueues.get(guild.id);
     if (!s) return;
     if (s.loop && s.current) s.queue.unshift({ ...s.current });
-    setTimeout(() => playNext(guild.id), 500);
+    setTimeout(() => playNext(client, guild.id), 500);
   });
 
-  player.on('error', err => {
+  player.on('error', (err) => {
     console.error('[Music] Player error:', err.message);
-    setTimeout(() => playNext(guild.id), 1000);
+    setTimeout(() => playNext(client, guild.id), 1000);
   });
 
-  // ── Connection events ─────────────────────────────────────────────────
+  // ── Connection events ──
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     console.warn('[Music] Disconnected — attempting reconnect...');
     try {
@@ -241,60 +282,59 @@ async function getOrCreateState(guild, voiceChannel) {
       console.log('[Music] Reconnected ✅');
     } catch {
       console.warn('[Music] Reconnect failed — cleaning up');
-      try { connection.destroy(); } catch {}
-      musicState.delete(guild.id);
+      try { connection.destroy(); } catch { /* ignore */ }
+      client.musicQueues.delete(guild.id);
     }
   });
 
   connection.on(VoiceConnectionStatus.Destroyed, () => {
     console.warn('[Music] Connection destroyed');
-    musicState.delete(guild.id);
+    client.musicQueues.delete(guild.id);
   });
 
-  connection.on('error', err => console.error('[Music] Connection error:', err.message));
+  connection.on('error', (err) => console.error('[Music] Connection error:', err.message));
 
   return state;
 }
 
-// ── Slash command ──────────────────────────────────────────────────────────
+// ── Slash command ─────────────────────────────────────────────────────────
 export default {
   data: new SlashCommandBuilder()
     .setName('music')
     .setDescription('Music Player — YouTube')
-    .addSubcommand(s => s
+    .addSubcommand((s) => s
       .setName('play')
       .setDescription('Play a song from YouTube')
-      .addStringOption(o => o
+      .addStringOption((o) => o
         .setName('query')
         .setDescription('Song name or YouTube URL')
-        .setRequired(true)
-      )
-    )
-    .addSubcommand(s => s.setName('skip').setDescription('Skip the current track'))
-    .addSubcommand(s => s.setName('stop').setDescription('Stop music and clear queue'))
-    .addSubcommand(s => s.setName('queue').setDescription('View the current queue'))
-    .addSubcommand(s => s.setName('pause').setDescription('Pause playback'))
-    .addSubcommand(s => s.setName('resume').setDescription('Resume playback'))
-    .addSubcommand(s => s.setName('loop').setDescription('Toggle loop for current track'))
-    .addSubcommand(s => s
+        .setRequired(true)))
+    .addSubcommand((s) => s.setName('skip').setDescription('Skip the current track'))
+    .addSubcommand((s) => s.setName('stop').setDescription('Stop music and clear queue'))
+    .addSubcommand((s) => s.setName('queue').setDescription('View the current queue'))
+    .addSubcommand((s) => s.setName('pause').setDescription('Pause playback'))
+    .addSubcommand((s) => s.setName('resume').setDescription('Resume playback'))
+    .addSubcommand((s) => s.setName('loop').setDescription('Toggle loop for current track'))
+    .addSubcommand((s) => s
       .setName('volume')
       .setDescription('Set volume (0–100)')
-      .addIntegerOption(o => o
+      .addIntegerOption((o) => o
         .setName('level')
         .setDescription('Volume level')
         .setRequired(true)
         .setMinValue(0)
-        .setMaxValue(100)
-      )
-    )
-    .addSubcommand(s => s.setName('nowplaying').setDescription('Show currently playing track')),
+        .setMaxValue(100)))
+    .addSubcommand((s) => s.setName('nowplaying').setDescription('Show currently playing track'))
+    .addSubcommand((s) => s.setName('shuffle').setDescription('Shuffle the queue')),
 
-  async execute(interaction) {
+  cooldown: 1,
+
+  async execute(interaction, client) {
     const sub          = interaction.options.getSubcommand();
     const voiceChannel = interaction.member?.voice?.channel;
-    const state        = musicState.get(interaction.guildId);
+    const state        = client.musicQueues.get(interaction.guildId);
 
-    // Helper — works whether we've deferred or not
+    // Helper — works whether we've deferred or not.
     const reply = (embed, ephemeral = false) => {
       const opts = { embeds: [embed], ...(ephemeral ? { flags: [64] } : {}) };
       return (interaction.replied || interaction.deferred)
@@ -311,150 +351,177 @@ export default {
       .setColor(C.error).setTitle('Nothing Playing')
       .setFooter(FOOTER).setTimestamp();
 
-    // Commands that don't need voice
+    // ── Commands that don't need voice ──
     if (['queue', 'nowplaying'].includes(sub)) {
       if (sub === 'queue') {
-        if (!state?.current)
-          return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Queue Empty').setDescription('Nothing is playing.').setFooter(FOOTER).setTimestamp());
+        if (!state?.current) {
+          return reply(new EmbedBuilder()
+            .setColor(C.info).setTitle('Queue Empty')
+            .setDescription('Nothing is playing.')
+            .setFooter(FOOTER).setTimestamp());
+        }
         const list = state.queue.slice(0, 10)
           .map((t, i) => `**${i + 1}.** [${t.title}](${t.url})`)
           .join('\n');
         return reply(new EmbedBuilder()
-          .setColor(C.music ?? '#1DB954').setTitle('Music Queue')
+          .setColor(C.music).setTitle('Music Queue')
           .setDescription(`**Now Playing:** [${state.current.title}](${state.current.url})\n\n${list || 'No more tracks.'}`)
-          .setFooter({ text: `${state.queue.length} track(s) · Loop: ${state.loop ? 'ON' : 'OFF'}` })
-          .setTimestamp()
-        );
+          .setFooter({ text: `SkyBot v2 • ${state.queue.length} track(s) · Loop: ${state.loop ? 'ON' : 'OFF'}` })
+          .setTimestamp());
       }
 
       if (sub === 'nowplaying') {
-        if (!state?.current)
-          return reply(new EmbedBuilder().setColor(C.info ?? '#5865F2').setTitle('Nothing Playing').setFooter(FOOTER).setTimestamp());
+        if (!state?.current) {
+          return reply(new EmbedBuilder()
+            .setColor(C.info).setTitle('Nothing Playing')
+            .setFooter(FOOTER).setTimestamp());
+        }
         const t = state.current;
         return reply(new EmbedBuilder()
-          .setColor(C.music ?? '#1DB954').setTitle('Now Playing')
+          .setColor(C.music).setTitle('Now Playing')
           .setDescription(`**[${t.title}](${t.url})**`)
           .setThumbnail(t.thumbnail)
           .addFields(
-            { name: 'Duration', value: t.duration,              inline: true },
-            { name: 'Author',   value: t.author,                inline: true },
-            { name: 'Queue',    value: `${state.queue.length} up next`, inline: true },
+            { name: 'Duration', value: t.duration,                       inline: true },
+            { name: 'Author',   value: t.author,                         inline: true },
+            { name: 'Queue',    value: `${state.queue.length} up next`,  inline: true },
           )
-          .setFooter(FOOTER).setTimestamp()
-        );
+          .setFooter(FOOTER).setTimestamp());
       }
     }
 
-    // All other commands need voice
-    if (!voiceChannel)
-      return reply(noVoiceEmbed(), true);
+    // All other commands need voice.
+    if (!voiceChannel) return reply(noVoiceEmbed(), true);
 
-    // ── PLAY ─────────────────────────────────────────────────────────
+    // ── PLAY ──────────────────────────────────────────────────────
     if (sub === 'play') {
       await interaction.deferReply();
       const query = interaction.options.getString('query');
       try {
-        const track = await searchYouTube(query);
-        const s     = await getOrCreateState(interaction.guild, voiceChannel);
+        const track = await getVideoInfo(query);
+        const s     = await getOrCreateState(client, interaction.guild, voiceChannel);
         s.queue.push(track);
         const wasIdle = s.current === null;
-        if (wasIdle) playNext(interaction.guildId);
+        if (wasIdle) playNext(client, interaction.guildId);
 
         return interaction.editReply({ embeds: [new EmbedBuilder()
-          .setColor(C.music ?? '#1DB954')
+          .setColor(C.music)
           .setTitle(wasIdle ? '🎵 Now Playing' : '📋 Added to Queue')
           .setDescription(`**[${track.title}](${track.url})**`)
           .addFields(
-            { name: 'Duration', value: track.duration,                           inline: true },
-            { name: 'Author',   value: track.author,                             inline: true },
-            { name: 'Position', value: wasIdle ? 'Playing now' : `#${s.queue.length}`, inline: true },
+            { name: 'Duration', value: track.duration,                                   inline: true },
+            { name: 'Author',   value: track.author,                                     inline: true },
+            { name: 'Position', value: wasIdle ? 'Playing now' : `#${s.queue.length}`,   inline: true },
           )
           .setThumbnail(track.thumbnail)
-          .setFooter(FOOTER).setTimestamp()
-        ]});
+          .setFooter(FOOTER).setTimestamp()] });
       } catch (err) {
         console.error('[Music] play error:', err.message);
         return interaction.editReply({ embeds: [new EmbedBuilder()
           .setColor(C.error).setTitle('Error')
           .setDescription(err.message)
-          .setFooter(FOOTER).setTimestamp()
-        ]});
+          .setFooter(FOOTER).setTimestamp()] });
       }
     }
 
-    // ── SKIP ─────────────────────────────────────────────────────────
+    // ── SKIP ──────────────────────────────────────────────────────
     if (sub === 'skip') {
       if (!state?.current) return reply(nothingEmbed(), true);
       const title  = state.current.title;
       state.loop   = false;
       state.player.stop();
       return reply(new EmbedBuilder()
-        .setColor(C.success ?? '#57F287').setTitle('⏭ Skipped')
+        .setColor(C.success).setTitle('⏭ Skipped')
         .setDescription(`Skipped **${title}**`)
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setFooter(FOOTER).setTimestamp());
     }
 
-    // ── STOP ─────────────────────────────────────────────────────────
+    // ── STOP ──────────────────────────────────────────────────────
     if (sub === 'stop') {
       if (!state) return reply(nothingEmbed(), true);
       state.queue   = [];
       state.current = null;
       state.loop    = false;
-      try { state.player.stop(true); } catch {}
-      try { state.connection.destroy(); } catch {}
-      musicState.delete(interaction.guildId);
+      try { state.player.stop(true); } catch { /* ignore */ }
+      try { state.connection.destroy(); } catch { /* ignore */ }
+      client.musicQueues.delete(interaction.guildId);
       return reply(new EmbedBuilder()
-        .setColor(C.success ?? '#57F287').setTitle('⏹ Stopped')
+        .setColor(C.success).setTitle('⏹ Stopped')
         .setDescription('Queue cleared and bot left.')
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setFooter(FOOTER).setTimestamp());
     }
 
-    // ── PAUSE ────────────────────────────────────────────────────────
+    // ── PAUSE ─────────────────────────────────────────────────────
     if (sub === 'pause') {
       if (!state?.current) return reply(nothingEmbed(), true);
       state.player.pause();
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('⏸ Paused')
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setColor(C.music).setTitle('⏸ Paused')
+        .setFooter(FOOTER).setTimestamp());
     }
 
-    // ── RESUME ───────────────────────────────────────────────────────
+    // ── RESUME ────────────────────────────────────────────────────
     if (sub === 'resume') {
       if (!state?.current) return reply(nothingEmbed(), true);
       state.player.unpause();
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('▶ Resumed')
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setColor(C.music).setTitle('▶ Resumed')
+        .setFooter(FOOTER).setTimestamp());
     }
 
-    // ── LOOP ─────────────────────────────────────────────────────────
+    // ── LOOP ──────────────────────────────────────────────────────
     if (sub === 'loop') {
       if (!state) return reply(nothingEmbed(), true);
       state.loop = !state.loop;
+      // Persist preference.
+      const db = getDb();
+      if (!db.musicSettings) db.musicSettings = {};
+      if (!db.musicSettings[interaction.guildId]) db.musicSettings[interaction.guildId] = {};
+      db.musicSettings[interaction.guildId].loop = state.loop;
+      await saveDb();
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('🔁 Loop')
+        .setColor(C.music).setTitle('🔁 Loop')
         .setDescription(`Loop is now **${state.loop ? 'ON' : 'OFF'}**`)
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setFooter(FOOTER).setTimestamp());
     }
 
-    // ── VOLUME ───────────────────────────────────────────────────────
+    // ── VOLUME ────────────────────────────────────────────────────
+    // Note: inlineVolume is disabled (Railway-safe — no opusscript native
+    // bindings). Volume preference is saved to db.musicSettings and applied
+    // when the next track starts via ffmpeg -filter:a volume=N.
     if (sub === 'volume') {
       const level = interaction.options.getInteger('level');
-      if (state) {
-        state.volume = level / 100;
-        // Apply to currently playing resource if any
-        try { state.player._resource?.volume?.setVolume(state.volume); } catch {}
+      if (state) state.volume = level;
+      const db = getDb();
+      if (!db.musicSettings) db.musicSettings = {};
+      if (!db.musicSettings[interaction.guildId]) db.musicSettings[interaction.guildId] = {};
+      db.musicSettings[interaction.guildId].volume = level;
+      await saveDb();
+      return reply(new EmbedBuilder()
+        .setColor(C.music).setTitle('🔊 Volume')
+        .setDescription(`Volume preference saved as **${level}%**.\nApplied to the next track (Railway-safe mode disables live volume changes).`)
+        .setFooter(FOOTER).setTimestamp());
+    }
+
+    // ── SHUFFLE ───────────────────────────────────────────────────
+    if (sub === 'shuffle') {
+      if (!state) return reply(nothingEmbed(), true);
+      if (state.queue.length < 2) {
+        return reply(new EmbedBuilder()
+          .setColor(C.warning).setTitle('Shuffle')
+          .setDescription('Need at least 2 tracks in the queue to shuffle.')
+          .setFooter(FOOTER).setTimestamp());
+      }
+      // Fisher-Yates shuffle
+      const q = state.queue;
+      for (let i = q.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [q[i], q[j]] = [q[j], q[i]];
       }
       return reply(new EmbedBuilder()
-        .setColor(C.music ?? '#1DB954').setTitle('🔊 Volume')
-        .setDescription(`Volume set to **${level}%**`)
-        .setFooter(FOOTER).setTimestamp()
-      );
+        .setColor(C.music).setTitle('🔀 Shuffled')
+        .setDescription(`Shuffled **${q.length}** track(s) in the queue.`)
+        .setFooter(FOOTER).setTimestamp());
     }
   },
 };

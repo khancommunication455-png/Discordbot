@@ -1,35 +1,48 @@
-import { SlashCommandBuilder } from 'discord.js';
+/**
+ * link.js — Link Discord account to Minecraft IGN
+ */
+import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getUUID } from '../../services/hypixel.js';
 import { getDb, saveDb } from '../../utils/db.js';
-import { successEmbed, errorEmbed } from '../../utils/embeds.js';
+import { C, successEmbed, errorEmbed } from '../../utils/embeds.js';
 
 export default {
   data: new SlashCommandBuilder()
     .setName('link')
-    .setDescription('Link your Minecraft IGN to SkyBot for auction tracking & profile view')
+    .setDescription('Link your Discord account to your Minecraft IGN')
     .addStringOption(o =>
-      o.setName('ign').setDescription('Your Minecraft username').setRequired(true)
-    ),
-  cooldown: 10,
+      o.setName('ign').setDescription('Your Minecraft in-game name').setRequired(true)),
 
-  async execute(interaction, client) {
-    await interaction.deferReply();
+  async execute(interaction) {
+    await interaction.deferReply({ flags: [64] });
     const ign = interaction.options.getString('ign').trim();
 
     try {
-      const mojang = await getUUID(ign);
+      const { id: uuid, name: resolvedIGN } = await getUUID(ign);
       const db = getDb();
-      db.data.linkedPlayers[interaction.user.id] = { ign: mojang.name, uuid: mojang.id };
+      if (!db.linkedPlayers) db.linkedPlayers = {};
+      db.linkedPlayers[interaction.user.id] = {
+        ign: resolvedIGN,
+        uuid,
+        linkedAt: Date.now(),
+      };
       await saveDb();
 
-      await interaction.editReply({
-        embeds: [successEmbed('Account Linked!',
-          `Your Discord is now linked to **${mojang.name}**.\n` +
-          `You'll get DM pings when your auctions sell, and you can use \`/profile\`.`
-        )],
+      return interaction.editReply({
+        embeds: [new EmbedBuilder()
+          .setColor(C.success)
+          .setTitle('✅ Account Linked')
+          .setDescription(`Your Discord account is now linked to **${resolvedIGN}**.`)
+          .addFields(
+            { name: 'IGN', value: resolvedIGN, inline: true },
+            { name: 'UUID', value: `\`${uuid}\``, inline: true },
+          )
+          .setThumbnail(`https://mc-heads.net/avatar/${uuid}/64`)
+          .setFooter({ text: 'SkyBot v2 • Railway Edition' })
+          .setTimestamp()],
       });
     } catch (err) {
-      await interaction.editReply({ embeds: [errorEmbed('Link Failed', `Could not find player \`${ign}\`. Check the spelling.`)] });
+      return interaction.editReply({ embeds: [errorEmbed('Link Failed', err.message)] });
     }
   },
 };

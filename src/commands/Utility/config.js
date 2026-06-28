@@ -1,285 +1,221 @@
 /**
- * config.js — Admin configuration system
- * Note: setDefaultMemberPermissions only on main builder, NOT on subcommands
+ * config.js — SkyBot v2 Server configuration command
+ *
+ * Replaces v1's Utility/config.js (which was carry/cmd/bot-voice focused).
+ * The carry/tts/custom-command config has been moved to dedicated commands
+ * (/carry, /tts); this command now centralizes the server-wide settings
+ * the task spec calls out: view, set, reset, welcome, goodbye, autorole,
+ * logging, birthday.
+ *
+ * Flat-db paths used:
+ *   db.guildConfig[guildId]       — arbitrary key/value store (prefix, etc.)
+ *   db.welcomeConfig[guildId]     — welcome message settings
+ *   db.goodbyeConfig[guildId]     — goodbye message settings
+ *   db.autoRole[guildId]          — array of role IDs assigned on join
+ *   db.loggingConfig[guildId]     — { channel, enabled }
+ *   db.birthdayChannel[guildId]   — birthday announcement channel ID
+ *   db.birthdays[guildId]         — { [userId]: { day, month } }
  */
-import {
-  SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ChannelType,
-} from 'discord.js';
+import { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ChannelType } from 'discord.js';
 import { getDb, saveDb } from '../../utils/db.js';
-import { C } from '../../utils/embeds.js';
-import { moveTTS, setupTTS, getTTSState } from '../../services/ttsService.js';
-import { CARRY_TYPES } from '../Carries/carry.js';
-import { getVoiceConnection } from '@discordjs/voice';
+import { successEmbed, errorEmbed, infoEmbed, warningEmbed, C } from '../../utils/embeds.js';
 
-const FOOTER = { text: 'TITAN Jr. Config' };
+const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
+
+// Allowlist of /config set keys (prevents arbitrary pollution of guildConfig)
+const SETTABLE_KEYS = new Set([
+  'prefix',
+]);
 
 export default {
+  cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('config')
-    .setDescription('Admin configuration — carry prices, custom commands, bot settings')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommandGroup(g => g
-      .setName('carry')
-      .setDescription('Carry system configuration')
-      .addSubcommand(s => s
-        .setName('setprice')
-        .setDescription('Edit price for a carry type')
-        .addStringOption(o =>
-          o.setName('type').setDescription('Carry type').setRequired(true)
-           .addChoices(...Object.entries(CARRY_TYPES).slice(0,25).map(([v,d]) => ({ name: `${d.emoji} ${d.label}`, value: v })))
+    .setDescription('Server configuration — view & edit SkyBot settings')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s => s
+      .setName('view')
+      .setDescription('View all SkyBot settings for this server')
+    )
+    .addSubcommand(s => s
+      .setName('set')
+      .setDescription('Set a server config key (e.g. prefix)')
+      .addStringOption(o => o.setName('key').setDescription('Config key').setRequired(true)
+        .addChoices({ name: 'prefix', value: 'prefix' })
+      )
+      .addStringOption(o => o.setName('value').setDescription('New value').setRequired(true))
+    )
+    .addSubcommand(s => s
+      .setName('reset')
+      .setDescription('Reset this server\'s guildConfig (preserves welcome/goodbye/autorole)')
+    )
+    .addSubcommand(s => s
+      .setName('welcome')
+      .setDescription('Toggle welcome messages on/off (configure via /welcome setup)')
+      .addBooleanOption(o => o.setName('enabled').setDescription('Enable welcome messages?').setRequired(true))
+    )
+    .addSubcommand(s => s
+      .setName('goodbye')
+      .setDescription('Toggle goodbye messages on/off (configure via /welcome goodbye)')
+      .addBooleanOption(o => o.setName('enabled').setDescription('Enable goodbye messages?').setRequired(true))
+    )
+    .addSubcommand(s => s
+      .setName('autorole')
+      .setDescription('List or clear auto-assigned roles (add via /welcome autorole)')
+      .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
+        .addChoices(
+          { name: 'list',  value: 'list'  },
+          { name: 'clear', value: 'clear' },
         )
-        .addStringOption(o => o.setName('price').setDescription('New price e.g. 25M').setRequired(true))
-      )
-      .addSubcommand(s => s
-        .setName('addtype')
-        .setDescription('Add a custom carry type')
-        .addStringOption(o => o.setName('id').setDescription('Unique ID e.g. fishing').setRequired(true))
-        .addStringOption(o => o.setName('label').setDescription('Display name e.g. Fishing Carry').setRequired(true))
-        .addStringOption(o => o.setName('price').setDescription('Price e.g. 10M').setRequired(true))
-        .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(false))
-        .addStringOption(o => o.setName('category').setDescription('Category').setRequired(false))
-      )
-      .addSubcommand(s => s.setName('prices').setDescription('View all carry prices'))
-    )
-    .addSubcommandGroup(g => g
-      .setName('cmd')
-      .setDescription('Custom command management')
-      .addSubcommand(s => s
-        .setName('add')
-        .setDescription('Add a custom text command (e.g. !rules)')
-        .addStringOption(o => o.setName('trigger').setDescription('Trigger e.g. !rules').setRequired(true))
-        .addStringOption(o => o.setName('response').setDescription('Response text').setRequired(true))
-        .addStringOption(o => o.setName('title').setDescription('Embed title').setRequired(false))
-        .addStringOption(o => o.setName('color').setDescription('Color hex e.g. #ff6600').setRequired(false))
-      )
-      .addSubcommand(s => s
-        .setName('remove')
-        .setDescription('Remove a custom command')
-        .addStringOption(o => o.setName('trigger').setDescription('Trigger to remove').setRequired(true))
-      )
-      .addSubcommand(s => s.setName('list').setDescription('List all custom commands'))
-      .addSubcommand(s => s
-        .setName('edit')
-        .setDescription('Edit a custom command response')
-        .addStringOption(o => o.setName('trigger').setDescription('Trigger to edit').setRequired(true))
-        .addStringOption(o => o.setName('response').setDescription('New response').setRequired(true))
       )
     )
-    .addSubcommandGroup(g => g
-      .setName('bot')
-      .setDescription('Bot voice and channel control')
-      .addSubcommand(s => s
-        .setName('join')
-        .setDescription('Make bot join a voice channel')
-        .addChannelOption(o => o.setName('channel').setDescription('Voice channel').addChannelTypes(ChannelType.GuildVoice).setRequired(true))
-      )
-      .addSubcommand(s => s.setName('leave').setDescription('Make bot leave voice channel'))
-      .addSubcommand(s => s
-        .setName('movetts')
-        .setDescription('Move TTS to a different voice channel')
-        .addChannelOption(o => o.setName('channel').setDescription('New voice channel').addChannelTypes(ChannelType.GuildVoice).setRequired(true))
-      )
-      .addSubcommand(s => s
-        .setName('settschannel')
-        .setDescription('Change which text channel TTS reads from')
-        .addChannelOption(o => o.setName('channel').setDescription('Text channel').addChannelTypes(ChannelType.GuildText).setRequired(true))
-      )
+    .addSubcommand(s => s
+      .setName('logging')
+      .setDescription('Set or clear the moderation log channel')
+      .addChannelOption(o => o.setName('channel').setDescription('Log channel (omit to disable)').addChannelTypes(ChannelType.GuildText).setRequired(false))
     )
-    .addSubcommandGroup(g => g
-      .setName('settings')
-      .setDescription('Server-wide bot settings')
-      .addSubcommand(s => s.setName('view').setDescription('View all bot settings for this server'))
-      .addSubcommand(s => s
-        .setName('prefix')
-        .setDescription('Set custom command prefix')
-        .addStringOption(o => o.setName('prefix').setDescription('New prefix').setRequired(true))
-      )
-      .addSubcommand(s => s
-        .setName('setlog')
-        .setDescription('Set mod log channel')
-        .addChannelOption(o => o.setName('channel').setDescription('Log channel').addChannelTypes(ChannelType.GuildText).setRequired(true))
-      )
+    .addSubcommand(s => s
+      .setName('birthday')
+      .setDescription('Set or clear the birthday announcement channel')
+      .addChannelOption(o => o.setName('channel').setDescription('Birthday channel (omit to disable)').addChannelTypes(ChannelType.GuildText).setRequired(false))
     ),
 
   async execute(interaction, client) {
     await interaction.deferReply({ flags: [64] });
 
-    const group   = interaction.options.getSubcommandGroup();
     const sub     = interaction.options.getSubcommand();
     const guildId = interaction.guildId;
     const db      = getDb();
 
-    // Init config
-    if (!db.data.guildConfig)                         db.data.guildConfig = {};
-    if (!db.data.guildConfig[guildId])                db.data.guildConfig[guildId] = {};
-    if (!db.data.guildConfig[guildId].carryPrices)   db.data.guildConfig[guildId].carryPrices = {};
-    if (!db.data.guildConfig[guildId].customCarries) db.data.guildConfig[guildId].customCarries = {};
-    if (!db.data.guildConfig[guildId].customCmds)    db.data.guildConfig[guildId].customCmds = {};
-    const cfg = db.data.guildConfig[guildId];
+    // Ensure flat-db structures exist
+    if (!db.guildConfig)            db.guildConfig = {};
+    if (!db.guildConfig[guildId])   db.guildConfig[guildId] = {};
+    if (!db.welcomeConfig)          db.welcomeConfig = {};
+    if (!db.goodbyeConfig)          db.goodbyeConfig = {};
+    if (!db.autoRole)               db.autoRole = {};
+    if (!db.loggingConfig)          db.loggingConfig = {};
+    if (!db.birthdayChannel)        db.birthdayChannel = {};
 
-    const ok  = (t, d)  => interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.success).setTitle(t).setDescription(d).setFooter(FOOTER).setTimestamp()] });
-    const err = (t, d)  => interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle(t).setDescription(d).setFooter(FOOTER).setTimestamp()] });
+    const cfg = db.guildConfig[guildId];
 
-    // ══ CARRY ════════════════════════════════════════════════════════
-    if (group === 'carry') {
-      if (sub === 'setprice') {
-        const type  = interaction.options.getString('type');
-        const price = interaction.options.getString('price');
-        cfg.carryPrices[type] = price;
-        await saveDb();
-        // Auto-refresh carry panel
-        if (cfg.carryChannelId && cfg.carryPanelMsgId) {
-          try {
-            const ch  = await client.channels.fetch(cfg.carryChannelId);
-            const msg = await ch.messages.fetch(cfg.carryPanelMsgId);
-            const { buildPanelEmbed, buildPanelButtons } = await import('../Carries/carry.js');
-            await msg.edit({ embeds: [buildPanelEmbed(interaction.guild, guildId)], components: buildPanelButtons(guildId) });
-          } catch {}
-        }
-        return ok('Price Updated', `**${CARRY_TYPES[type]?.emoji} ${CARRY_TYPES[type]?.label}** → **${price}**\nPanel refreshed.`);
+    // ── VIEW ───────────────────────────────────────────────────────────
+    if (sub === 'view') {
+      const wlc  = db.welcomeConfig[guildId];
+      const bye  = db.goodbyeConfig[guildId];
+      const arol = db.autoRole[guildId] ?? [];
+      const log  = db.loggingConfig[guildId];
+      const bdCh = db.birthdayChannel[guildId];
+      const warnCount = Object.values(db.warnings?.[guildId] ?? {}).reduce((s, a) => s + (a?.length ?? 0), 0);
+      const bdCount   = Object.keys(db.birthdays?.[guildId] ?? {}).length;
+
+      const embed = new EmbedBuilder()
+        .setColor(C.info)
+        .setTitle(`⚙️ ${interaction.guild.name} — Configuration`)
+        .addFields(
+          { name: 'Prefix',           value: `\`${cfg.prefix ?? '!'}\``,                          inline: true  },
+          { name: 'Welcome',          value: wlc?.enabled ? `✅ <#${wlc.channel}>` : '❌ Off',     inline: true  },
+          { name: 'Goodbye',          value: bye?.enabled ? `✅ <#${bye.channel}>` : '❌ Off',     inline: true  },
+          { name: 'Auto Roles',       value: arol.length ? arol.map(r => `<@&${r}>`).join(', ') : 'None', inline: true },
+          { name: 'Mod Log',          value: log?.enabled && log.channel ? `✅ <#${log.channel}>` : '❌ Off', inline: true },
+          { name: 'Birthday Channel', value: bdCh ? `✅ <#${bdCh}>` : '❌ Off',                     inline: true  },
+          { name: 'Total Warnings',   value: `${warnCount}`,                                       inline: true  },
+          { name: 'Birthday Records', value: `${bdCount}`,                                         inline: true  },
+          { name: 'TTS Voice',        value: db.ttsVoiceChannel?.[guildId] ? `<#${db.ttsVoiceChannel[guildId]}>` : '❌ Off', inline: true },
+        )
+        .setFooter(FOOTER)
+        .setTimestamp();
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── SET ────────────────────────────────────────────────────────────
+    if (sub === 'set') {
+      const key   = interaction.options.getString('key');
+      const value = interaction.options.getString('value');
+      if (!SETTABLE_KEYS.has(key)) {
+        return interaction.editReply({ embeds: [errorEmbed('Invalid Key', `Allowed keys: ${[...SETTABLE_KEYS].join(', ')}`)] });
       }
+      cfg[key] = value;
+      await saveDb();
+      return interaction.editReply({ embeds: [successEmbed('Setting Updated', `\`${key}\` → \`${value}\``)] });
+    }
 
-      if (sub === 'addtype') {
-        const id    = interaction.options.getString('id').toLowerCase().replace(/\s/g, '_');
-        const label = interaction.options.getString('label');
-        const price = interaction.options.getString('price');
-        const emoji = interaction.options.getString('emoji') ?? '⚔️';
-        const cat   = interaction.options.getString('category') ?? 'Custom';
-        cfg.customCarries[id] = { label, price, emoji, category: cat };
-        cfg.carryPrices[id]   = price;
-        await saveDb();
-        return ok('Carry Type Added', `${emoji} **${label}** at **${price}** in category **${cat}**.`);
+    // ── RESET ──────────────────────────────────────────────────────────
+    if (sub === 'reset') {
+      db.guildConfig[guildId] = {};
+      await saveDb();
+      return interaction.editReply({ embeds: [successEmbed('Reset', 'Server guildConfig cleared. Welcome/goodbye/autorole/logging/birthday preserved.')] });
+    }
+
+    // ── WELCOME ────────────────────────────────────────────────────────
+    if (sub === 'welcome') {
+      const enabled = interaction.options.getBoolean('enabled');
+      if (!db.welcomeConfig[guildId]) db.welcomeConfig[guildId] = { channel: null, message: '', ping: false, image: null, enabled: false };
+      db.welcomeConfig[guildId].enabled = enabled;
+      await saveDb();
+      if (enabled && !db.welcomeConfig[guildId].channel) {
+        return interaction.editReply({ embeds: [warningEmbed('Enabled (no channel)', 'Welcome is on but no channel/message is configured. Run `/welcome setup`.')] });
       }
+      return interaction.editReply({ embeds: [successEmbed('Welcome', `Welcome messages **${enabled ? 'enabled' : 'disabled'}**.`)] });
+    }
 
-      if (sub === 'prices') {
-        const lines = Object.entries(CARRY_TYPES).map(([k, d]) => {
-          const p = cfg.carryPrices[k] ?? d.price;
-          return `${d.emoji} **${d.label}**: ${p}${cfg.carryPrices[k] ? ' ✏️' : ''}`;
-        });
-        return interaction.editReply({
-          embeds: [new EmbedBuilder().setColor(C.carry).setTitle('Current Carry Prices').setDescription(lines.join('\n')).setFooter(FOOTER).setTimestamp()],
-        });
+    // ── GOODBYE ────────────────────────────────────────────────────────
+    if (sub === 'goodbye') {
+      const enabled = interaction.options.getBoolean('enabled');
+      if (!db.goodbyeConfig[guildId]) db.goodbyeConfig[guildId] = { channel: null, message: '', enabled: false };
+      db.goodbyeConfig[guildId].enabled = enabled;
+      await saveDb();
+      if (enabled && !db.goodbyeConfig[guildId].channel) {
+        return interaction.editReply({ embeds: [warningEmbed('Enabled (no channel)', 'Goodbye is on but no channel/message is configured. Run `/welcome goodbye`.')] });
+      }
+      return interaction.editReply({ embeds: [successEmbed('Goodbye', `Goodbye messages **${enabled ? 'enabled' : 'disabled'}**.`)] });
+    }
+
+    // ── AUTOROLE ───────────────────────────────────────────────────────
+    if (sub === 'autorole') {
+      const action = interaction.options.getString('action');
+      const roles  = db.autoRole[guildId] ?? [];
+      if (action === 'list') {
+        if (!roles.length) return interaction.editReply({ embeds: [infoEmbed('Auto Roles', 'No auto-roles set. Use `/welcome autorole` to add one.')] });
+        const embed = new EmbedBuilder()
+          .setColor(C.info)
+          .setTitle('🎭 Auto-Assigned Roles')
+          .setDescription(roles.map(r => `<@&${r}>`).join('\n'))
+          .setFooter(FOOTER)
+          .setTimestamp();
+        return interaction.editReply({ embeds: [embed] });
+      }
+      if (action === 'clear') {
+        db.autoRole[guildId] = [];
+        await saveDb();
+        return interaction.editReply({ embeds: [successEmbed('Cleared', 'All auto-roles removed.')] });
       }
     }
 
-    // ══ CMD ══════════════════════════════════════════════════════════
-    if (group === 'cmd') {
-      if (sub === 'add') {
-        const trigger = interaction.options.getString('trigger').toLowerCase().trim();
-        const response= interaction.options.getString('response');
-        const title   = interaction.options.getString('title') ?? null;
-        const color   = parseInt((interaction.options.getString('color') ?? '#5865f2').replace('#',''), 16) || 0x5865f2;
-        cfg.customCmds[trigger] = { response, title, color };
+    // ── LOGGING ────────────────────────────────────────────────────────
+    if (sub === 'logging') {
+      const channel = interaction.options.getChannel('channel');
+      if (!channel) {
+        db.loggingConfig[guildId] = { channel: null, enabled: false };
         await saveDb();
-        return ok('Command Added', `Trigger: \`${trigger}\`\nUsers can now type it in any channel.`);
+        return interaction.editReply({ embeds: [successEmbed('Logging Off', 'Moderation logging disabled.')] });
       }
-      if (sub === 'remove') {
-        const trigger = interaction.options.getString('trigger').toLowerCase().trim();
-        if (!cfg.customCmds[trigger]) return err('Not Found', `No command \`${trigger}\`.`);
-        delete cfg.customCmds[trigger];
-        await saveDb();
-        return ok('Removed', `\`${trigger}\` deleted.`);
-      }
-      if (sub === 'edit') {
-        const trigger  = interaction.options.getString('trigger').toLowerCase().trim();
-        const response = interaction.options.getString('response');
-        if (!cfg.customCmds[trigger]) return err('Not Found', `No command \`${trigger}\`.`);
-        cfg.customCmds[trigger].response = response;
-        await saveDb();
-        return ok('Updated', `\`${trigger}\` updated.`);
-      }
-      if (sub === 'list') {
-        const cmds = Object.entries(cfg.customCmds ?? {});
-        if (!cmds.length) return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('No Custom Commands').setDescription('Add one with `/config cmd add`.').setFooter(FOOTER).setTimestamp()] });
-        return interaction.editReply({
-          embeds: [new EmbedBuilder()
-            .setColor(C.info)
-            .setTitle(`Custom Commands (${cmds.length})`)
-            .setDescription(cmds.map(([t, d]) => `\`${t}\` → ${(d.response ?? '').slice(0,60)}`).join('\n'))
-            .setFooter(FOOTER).setTimestamp()
-          ],
-        });
-      }
+      db.loggingConfig[guildId] = { channel: channel.id, enabled: true };
+      await saveDb();
+      return interaction.editReply({ embeds: [successEmbed('Log Channel Set', `Moderation logs → ${channel}`)] });
     }
 
-    // ══ BOT ══════════════════════════════════════════════════════════
-    if (group === 'bot') {
-      if (sub === 'join') {
-        const channel = interaction.options.getChannel('channel');
-        const { joinVoiceChannel } = await import('@discordjs/voice');
-        const conn = joinVoiceChannel({
-          channelId: channel.id, guildId,
-          adapterCreator: interaction.guild.voiceAdapterCreator,
-          selfDeaf: false,
-        });
-        await new Promise(r => setTimeout(r, 1500));
-        return ok('Joined', `Bot joined **${channel.name}**.`);
-      }
-      if (sub === 'leave') {
-        const conn = getVoiceConnection(guildId);
-        if (conn) { conn.destroy(); return ok('Left', 'Bot left the voice channel.'); }
-        return err('Not Connected', 'Bot is not in a voice channel.');
-      }
-      if (sub === 'movetts') {
-        const channel = interaction.options.getChannel('channel');
-        const state   = getTTSState(guildId);
-        if (!state) {
-          await setupTTS(interaction.guild, channel.id);
-          db.data.ttsVoiceChannel[guildId] = channel.id;
-          await saveDb();
-          return ok('TTS Started', `TTS active in **${channel.name}**.`);
-        }
-        const moved = await moveTTS(interaction.guild, channel.id);
-        if (moved) {
-          db.data.ttsVoiceChannel[guildId] = channel.id;
-          await saveDb();
-          return ok('TTS Moved', `TTS moved to **${channel.name}**.`);
-        }
-        return err('Move Failed', 'Could not move TTS to that channel.');
-      }
-      if (sub === 'settschannel') {
-        const channel = interaction.options.getChannel('channel');
-        db.data.ttsChannels[guildId] = channel.id;
+    // ── BIRTHDAY ───────────────────────────────────────────────────────
+    if (sub === 'birthday') {
+      const channel = interaction.options.getChannel('channel');
+      if (!channel) {
+        delete db.birthdayChannel[guildId];
         await saveDb();
-        return ok('TTS Channel Updated', `TTS now reads from ${channel}.`);
+        return interaction.editReply({ embeds: [successEmbed('Birthday Channel Off', 'Birthday announcements disabled.')] });
       }
-    }
-
-    // ══ SETTINGS ═════════════════════════════════════════════════════
-    if (group === 'settings') {
-      if (sub === 'view') {
-        const ttsChId = db.data.ttsChannels?.[guildId];
-        const vcId    = db.data.ttsVoiceChannel?.[guildId];
-        const welcome = db.data.welcomeConfig?.[guildId];
-        const levCfg  = db.data.leveling?.[guildId]?.config;
-        return interaction.editReply({
-          embeds: [new EmbedBuilder()
-            .setColor(C.info)
-            .setTitle(`${interaction.guild.name} — Bot Settings`)
-            .addFields(
-              { name: 'Prefix',       value: cfg.prefix ?? '!',                                    inline: true },
-              { name: 'TTS Text',     value: ttsChId ? `<#${ttsChId}>` : 'Off',                   inline: true },
-              { name: 'TTS Voice',    value: vcId    ? `<#${vcId}>`    : 'Off',                   inline: true },
-              { name: 'Welcome',      value: welcome?.enabled ? `<#${welcome.channel}>` : 'Off',  inline: true },
-              { name: 'Leveling',     value: levCfg?.enabled  ? 'On'  : 'Off',                    inline: true },
-              { name: 'Custom Cmds',  value: `${Object.keys(cfg.customCmds ?? {}).length}`,       inline: true },
-              { name: 'Carry Channel',value: cfg.carryChannelId ? `<#${cfg.carryChannelId}>` : 'Not set', inline: true },
-            )
-            .setFooter(FOOTER).setTimestamp()
-          ],
-        });
-      }
-      if (sub === 'prefix') {
-        cfg.prefix = interaction.options.getString('prefix');
-        await saveDb();
-        return ok('Prefix Updated', `Custom command prefix: \`${cfg.prefix}\``);
-      }
-      if (sub === 'setlog') {
-        const ch = interaction.options.getChannel('channel');
-        cfg.logChannel = ch.id;
-        await saveDb();
-        return ok('Log Channel Set', `Mod logs → ${ch}`);
-      }
+      db.birthdayChannel[guildId] = channel.id;
+      await saveDb();
+      return interaction.editReply({ embeds: [successEmbed('Birthday Channel Set', `Birthday announcements → ${channel}`)] });
     }
   },
 };

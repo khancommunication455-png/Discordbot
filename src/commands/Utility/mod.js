@@ -1,7 +1,27 @@
+/**
+ * mod.js — SkyBot v2 Moderation command
+ *
+ * Ported from SkyBot v1 (Discordbot-main/src/commands/Utility/mod.js).
+ * Adapted for v2 SkyBot footer, cooldown: 3, and flat db access.
+ *
+ * Subcommands:
+ *   /mod ban      <user> [reason] [delete_days]
+ *   /mod unban    <user_id> [reason]
+ *   /mod kick     <user> [reason]
+ *   /mod timeout  <user> <minutes> [reason]
+ *   /mod untimeout <user>
+ *   /mod warn     <user> <reason>
+ *   /mod purge    <amount> [user]
+ *   /mod lock     [reason]
+ *   /mod unlock
+ *   /mod slowmode <seconds>
+ *
+ * Logs every action to LOG_CHANNEL_ID if set.
+ */
 import { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } from 'discord.js';
 import { C } from '../../utils/embeds.js';
 
-const FOOTER = { text: 'TITAN Jr. Moderation' };
+const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
 
 async function modLog(guild, client, data) {
   const chId = process.env.LOG_CHANNEL_ID;
@@ -9,7 +29,10 @@ async function modLog(guild, client, data) {
   const ch = await guild.channels.fetch(chId).catch(() => null);
   if (!ch) return;
 
-  const colors = { Ban: C.error, Kick: C.error, Timeout: C.warning, Warn: C.warning, Unban: C.success, Untimeout: C.success };
+  const colors = {
+    Ban: C.error, Kick: C.error, Timeout: C.warning, Warn: C.warning,
+    Unban: C.success, Untimeout: C.success,
+  };
 
   await ch.send({
     embeds: [new EmbedBuilder()
@@ -17,19 +40,21 @@ async function modLog(guild, client, data) {
       .setTitle(`Moderation · ${data.action}`)
       .setThumbnail(data.target?.displayAvatarURL?.() ?? data.target?.avatarURL?.() ?? null)
       .addFields(
-        { name: 'User',       value: `${data.target?.tag ?? data.targetId}\n\`${data.targetId}\``,  inline: true },
-        { name: 'Moderator',  value: `${data.mod.user.tag}`,                                        inline: true },
-        { name: 'Action',     value: data.action,                                                    inline: true },
-        { name: 'Reason',     value: data.reason,                                                    inline: false },
+        { name: 'User',       value: `${data.target?.tag ?? data.targetId}\n\`${data.targetId}\``, inline: true  },
+        { name: 'Moderator',  value: `${data.mod.user?.tag ?? data.mod.tag}`,                       inline: true  },
+        { name: 'Action',     value: data.action,                                                  inline: true  },
+        { name: 'Reason',     value: data.reason,                                                  inline: false },
         ...(data.extra ? [{ name: 'Details', value: data.extra, inline: false }] : []),
       )
       .setFooter(FOOTER)
-      .setTimestamp()
+      .setTimestamp(),
     ],
-  });
+  }).catch(() => {});
 }
 
 export default {
+  cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('mod')
     .setDescription('Moderation commands')
@@ -143,16 +168,17 @@ export default {
     // ── TIMEOUT ───────────────────────────────────────────────────────
     if (sub === 'timeout') {
       const member  = interaction.options.getMember('user');
+      if (!member) return reply(embed(C.error, 'Not Found', 'That member is not in this server.'));
       const minutes = interaction.options.getInteger('minutes');
       const until   = new Date(Date.now() + minutes * 60 * 1000);
       try {
         await member.timeout(minutes * 60 * 1000, reason);
         await modLog(interaction.guild, client, {
           action: 'Timeout', target: member.user, targetId: member.id,
-          mod: interaction.member, reason, extra: `Duration: **${minutes}m** · Expires <t:${Math.floor(until.getTime()/1000)}:R>`,
+          mod: interaction.member, reason, extra: `Duration: **${minutes}m** · Expires <t:${Math.floor(until.getTime() / 1000)}:R>`,
         });
         return reply(embed(C.warning, 'Member Timed Out',
-          `**${member.user.tag}** has been timed out for **${minutes} minute${minutes !== 1 ? 's' : ''}**.\n**Reason:** ${reason}\n**Expires:** <t:${Math.floor(until.getTime()/1000)}:R>`
+          `**${member.user.tag}** has been timed out for **${minutes} minute${minutes !== 1 ? 's' : ''}**.\n**Reason:** ${reason}\n**Expires:** <t:${Math.floor(until.getTime() / 1000)}:R>`
         ));
       } catch (err) {
         return reply(embed(C.error, 'Timeout Failed', err.message));
@@ -162,9 +188,14 @@ export default {
     // ── UNTIMEOUT ─────────────────────────────────────────────────────
     if (sub === 'untimeout') {
       const member = interaction.options.getMember('user');
-      await member.timeout(null);
-      await modLog(interaction.guild, client, { action: 'Untimeout', target: member.user, targetId: member.id, mod: interaction.member, reason: 'Timeout removed' });
-      return reply(embed(C.success, 'Timeout Removed', `**${member.user.tag}**'s timeout has been lifted.`));
+      if (!member) return reply(embed(C.error, 'Not Found', 'That member is not in this server.'));
+      try {
+        await member.timeout(null);
+        await modLog(interaction.guild, client, { action: 'Untimeout', target: member.user, targetId: member.id, mod: interaction.member, reason: 'Timeout removed' });
+        return reply(embed(C.success, 'Timeout Removed', `**${member.user.tag}**'s timeout has been lifted.`));
+      } catch (err) {
+        return reply(embed(C.error, 'Untimeout Failed', err.message));
+      }
     }
 
     // ── WARN ──────────────────────────────────────────────────────────
@@ -190,7 +221,7 @@ export default {
     // ── LOCK ──────────────────────────────────────────────────────────
     if (sub === 'lock') {
       await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false });
-      return reply(embed(C.error, 'Channel Locked', `🔒 <#${interaction.channelId}> has been locked.\n${reason !== 'No reason provided' ? `**Reason:** ${reason}` : ''}`));
+      return reply(embed(C.error, 'Channel Locked', `🔒 <#${interaction.channelId}> has been locked.${reason !== 'No reason provided' ? `\n**Reason:** ${reason}` : ''}`));
     }
 
     // ── UNLOCK ────────────────────────────────────────────────────────

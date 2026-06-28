@@ -1,9 +1,32 @@
+/**
+ * warns.js — SkyBot v2 Warnings & Notes system
+ *
+ * Ported from SkyBot v1 (Discordbot-main/src/commands/Utility/warns.js).
+ * Adapted for v2 flat db (db.warnings, db.userNotes) and SkyBot footer.
+ *
+ * Subcommands:
+ *   /warns add    <user> <reason>            — issue a warning (DM + log)
+ *   /warns list   <user>                     — list a user's warnings
+ *   /warns delete <user> <id>                — delete a specific warning by case ID
+ *   /warns clear  <user>                     — clear all warnings for a user
+ *   /warns note   <user> <note>              — add a private moderator note
+ *   /warns notes  <user>                     — view private notes for a user
+ *
+ * Flat-db schema (db.warnings):
+ *   { [guildId]: { [userId]: [{ id, reason, mod, ts }] } }
+ * Flat-db schema (db.userNotes):
+ *   { [guildId]: { [userId]: [{ note, mod, ts }] } }
+ */
 import { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { getDb, saveDb } from '../../utils/db.js';
-import { successEmbed, errorEmbed, warningEmbed } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, warningEmbed, C } from '../../utils/embeds.js';
 import { randomUUID } from 'crypto';
 
+const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
+
 export default {
+  cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('warns')
     .setDescription('Warning and notes system')
@@ -46,17 +69,20 @@ export default {
     const sub     = interaction.options.getSubcommand();
     const guildId = interaction.guildId;
     const db      = getDb();
-    if (!db.data.warnings[guildId])  db.data.warnings[guildId]  = {};
-    if (!db.data.userNotes[guildId]) db.data.userNotes[guildId] = {};
 
-    // ── ADD WARNING ───────────────────────────────────────────────────────
+    if (!db.warnings)             db.warnings = {};
+    if (!db.warnings[guildId])    db.warnings[guildId] = {};
+    if (!db.userNotes)            db.userNotes = {};
+    if (!db.userNotes[guildId])   db.userNotes[guildId] = {};
+
+    // ── ADD WARNING ────────────────────────────────────────────────────
     if (sub === 'add') {
       const user   = interaction.options.getUser('user');
       const reason = interaction.options.getString('reason');
       const id     = randomUUID().slice(0, 8).toUpperCase();
-      if (!db.data.warnings[guildId][user.id]) db.data.warnings[guildId][user.id] = [];
+      if (!db.warnings[guildId][user.id]) db.warnings[guildId][user.id] = [];
 
-      db.data.warnings[guildId][user.id].push({
+      db.warnings[guildId][user.id].push({
         id, reason,
         mod: interaction.user.id,
         ts:  Date.now(),
@@ -73,25 +99,25 @@ export default {
       if (logCh) {
         const ch = interaction.guild.channels.cache.get(logCh);
         if (ch) await ch.send({ embeds: [
-          new EmbedBuilder().setColor(0xfee75c)
+          new EmbedBuilder().setColor(C.warning)
             .setTitle('⚠️ Warning Issued')
             .addFields(
-              { name: 'User',   value: `${user.tag} (${user.id})`,            inline: true },
-              { name: 'Mod',    value: interaction.user.tag,                   inline: true },
+              { name: 'User',   value: `${user.tag} (${user.id})`,            inline: true  },
+              { name: 'Mod',    value: interaction.user.tag,                   inline: true  },
               { name: 'Reason', value: reason,                                 inline: false },
-              { name: 'Case',   value: `\`${id}\``,                           inline: true },
-              { name: 'Total',  value: `${db.data.warnings[guildId][user.id].length}`, inline: true },
-            ).setTimestamp()
-        ]});
+              { name: 'Case',   value: `\`${id}\``,                            inline: true  },
+              { name: 'Total',  value: `${db.warnings[guildId][user.id].length}`, inline: true },
+            ).setFooter(FOOTER).setTimestamp()
+        ]}).catch(() => {});
       }
 
       return interaction.reply({ embeds: [warningEmbed('Warning Issued', `**${user.tag}** has been warned.\n**Reason:** ${reason}\n**Case ID:** \`${id}\``)] });
     }
 
-    // ── LIST WARNINGS ─────────────────────────────────────────────────────
+    // ── LIST WARNINGS ──────────────────────────────────────────────────
     if (sub === 'list') {
       const user  = interaction.options.getUser('user');
-      const warns = db.data.warnings[guildId][user.id] ?? [];
+      const warns = db.warnings[guildId][user.id] ?? [];
       if (!warns.length) return interaction.reply({ embeds: [successEmbed('No Warnings', `**${user.tag}** has no warnings.`)] });
 
       const fields = warns.map(w => ({
@@ -101,51 +127,52 @@ export default {
       }));
 
       const embed = new EmbedBuilder()
-        .setColor(0xfee75c)
+        .setColor(C.warning)
         .setTitle(`⚠️ Warnings for ${user.tag} (${warns.length})`)
         .setThumbnail(user.displayAvatarURL())
         .addFields(fields)
+        .setFooter(FOOTER)
         .setTimestamp();
 
       return interaction.reply({ embeds: [embed] });
     }
 
-    // ── DELETE WARNING ────────────────────────────────────────────────────
+    // ── DELETE WARNING ─────────────────────────────────────────────────
     if (sub === 'delete') {
       const user   = interaction.options.getUser('user');
       const warnId = interaction.options.getString('id').toUpperCase();
-      const warns  = db.data.warnings[guildId][user.id] ?? [];
+      const warns  = db.warnings[guildId][user.id] ?? [];
       const before = warns.length;
-      db.data.warnings[guildId][user.id] = warns.filter(w => w.id !== warnId);
+      db.warnings[guildId][user.id] = warns.filter(w => w.id !== warnId);
       await saveDb();
-      if (db.data.warnings[guildId][user.id].length === before) {
+      if (db.warnings[guildId][user.id].length === before) {
         return interaction.reply({ embeds: [errorEmbed('Not Found', `No warning with ID \`${warnId}\` found.`)] });
       }
       return interaction.reply({ embeds: [successEmbed('Warning Deleted', `Removed warning \`${warnId}\` from **${user.tag}**.`)] });
     }
 
-    // ── CLEAR ─────────────────────────────────────────────────────────────
+    // ── CLEAR ──────────────────────────────────────────────────────────
     if (sub === 'clear') {
       const user = interaction.options.getUser('user');
-      db.data.warnings[guildId][user.id] = [];
+      db.warnings[guildId][user.id] = [];
       await saveDb();
       return interaction.reply({ embeds: [successEmbed('Cleared', `All warnings cleared for **${user.tag}**.`)] });
     }
 
-    // ── NOTE ──────────────────────────────────────────────────────────────
+    // ── NOTE ───────────────────────────────────────────────────────────
     if (sub === 'note') {
       const user = interaction.options.getUser('user');
       const note = interaction.options.getString('note');
-      if (!db.data.userNotes[guildId][user.id]) db.data.userNotes[guildId][user.id] = [];
-      db.data.userNotes[guildId][user.id].push({ note, mod: interaction.user.id, ts: Date.now() });
+      if (!db.userNotes[guildId][user.id]) db.userNotes[guildId][user.id] = [];
+      db.userNotes[guildId][user.id].push({ note, mod: interaction.user.id, ts: Date.now() });
       await saveDb();
       return interaction.reply({ embeds: [successEmbed('Note Added', `Note saved for **${user.tag}**.`)], flags: [64] });
     }
 
-    // ── NOTES ─────────────────────────────────────────────────────────────
+    // ── NOTES ──────────────────────────────────────────────────────────
     if (sub === 'notes') {
       const user  = interaction.options.getUser('user');
-      const notes = db.data.userNotes[guildId][user.id] ?? [];
+      const notes = db.userNotes[guildId][user.id] ?? [];
       if (!notes.length) return interaction.reply({ embeds: [successEmbed('No Notes', `No notes for **${user.tag}**.`)], flags: [64] });
       const fields = notes.map((n, i) => ({
         name:  `Note ${i + 1} — <t:${Math.floor(n.ts / 1000)}:D> by <@${n.mod}>`,
@@ -153,7 +180,7 @@ export default {
         inline: false,
       }));
       return interaction.reply({
-        embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`📝 Notes for ${user.tag}`).addFields(fields).setTimestamp()],
+        embeds: [new EmbedBuilder().setColor(C.info).setTitle(`📝 Notes for ${user.tag}`).addFields(fields).setFooter(FOOTER).setTimestamp()],
         flags: [64],
       });
     }

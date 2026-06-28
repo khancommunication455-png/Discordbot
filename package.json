@@ -1,34 +1,23 @@
 {
-  "name": "skybot",
-  "version": "1.0.0",
-  "description": "All-in-one Hypixel Skyblock Discord Bot \u2014 TITAN Jr.",
+  "name": "skybot-railway",
+  "version": "2.0.0",
+  "description": "SkyBot v2 — Railway-ready Hypixel Skyblock Discord Bot with flawless TTS/Voice and powerful AH Flip Tracker",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "deploy": "node src/deploy-commands.js"
+    "deploy": "node src/deploy-commands.js",
+    "register": "node src/deploy-commands.js"
   },
   "dependencies": {
-    "@discordjs/rest": "^2.4.0",
     "@discordjs/voice": "^0.18.0",
-    "@distube/ytdl-core": "^4.15.1",
-    "axios": "^1.7.2",
-    "discord.js": "^14.15.3",
+    "axios": "^1.7.7",
+    "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
-    "ejs": "^3.1.10",
-    "express": "^4.19.2",
-    "express-session": "^1.18.0",
-    "form-data": "^4.0.0",
-    "groq-sdk": "^0.5.0",
-    "libsodium-wrappers": "^0.7.15",
-    "lowdb": "^7.0.1",
-    "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2",
-    "opusscript": "^0.1.1",
-    "passport": "^0.7.0",
-    "passport-discord": "^0.1.4",
-    "tweetnacl": "^1.0.3"
+    "express": "^4.21.0",
+    "groq-sdk": "^0.7.0",
+    "node-cron": "^3.0.3"
   },
   "engines": {
     "node": ">=18.0.0"

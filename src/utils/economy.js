@@ -1,23 +1,82 @@
+/**
+ * economy.js — SkyBot v2 Economy utility functions
+ *
+ * Ported from SkyBot v1 (Discordbot-main/src/utils/economy.js).
+ * Adapted for v2 flat db (db.economy instead of db.data.economy).
+ *
+ * Provides:
+ *   - getEconomy(guildId, userId)  → user economy record (auto-creates)
+ *   - saveEconomy(guildId, userId, data) → persists user record (async)
+ *   - getBalance(guildId, userId)  → { wallet, bank, total }
+ *   - addCoins(guildId, userId, amount, where='wallet')
+ *   - removeCoins(guildId, userId, amount, where='wallet')
+ *   - transfer(guildId, fromId, toId, amount) → boolean
+ *   - formatMoney(n)              → "$1,234"
+ *   - parseDuration(str)          → ms  (e.g. "1h" → 3_600_000)
+ *   - formatDuration(ms)          → "1h 5m"
+ */
 import { getDb, saveDb } from './db.js';
 
 export function getEconomy(guildId, userId) {
   const db = getDb();
-  if (!db.data.economy[guildId]) db.data.economy[guildId] = {};
-  if (!db.data.economy[guildId][userId]) {
-    db.data.economy[guildId][userId] = {
+  if (!db.economy) db.economy = {};
+  if (!db.economy[guildId]) db.economy[guildId] = {};
+  if (!db.economy[guildId][userId]) {
+    db.economy[guildId][userId] = {
       wallet: 0, bank: 0,
       lastDaily: 0, lastWork: 0, lastCrime: 0, lastRob: 0,
       inventory: [], totalEarned: 0,
     };
   }
-  return db.data.economy[guildId][userId];
+  return db.economy[guildId][userId];
 }
 
 export async function saveEconomy(guildId, userId, data) {
   const db = getDb();
-  if (!db.data.economy[guildId]) db.data.economy[guildId] = {};
-  db.data.economy[guildId][userId] = data;
+  if (!db.economy) db.economy = {};
+  if (!db.economy[guildId]) db.economy[guildId] = {};
+  db.economy[guildId][userId] = data;
   await saveDb();
+}
+
+export function getBalance(guildId, userId) {
+  const d = getEconomy(guildId, userId);
+  return {
+    wallet: d.wallet ?? 0,
+    bank:   d.bank   ?? 0,
+    total:  (d.wallet ?? 0) + (d.bank ?? 0),
+  };
+}
+
+export async function addCoins(guildId, userId, amount, where = 'wallet') {
+  const d = getEconomy(guildId, userId);
+  const amt = Math.max(0, Math.floor(amount));
+  if (where === 'bank') d.bank   = (d.bank   ?? 0) + amt;
+  else                  d.wallet = (d.wallet ?? 0) + amt;
+  d.totalEarned = (d.totalEarned ?? 0) + amt;
+  await saveEconomy(guildId, userId, d);
+  return d;
+}
+
+export async function removeCoins(guildId, userId, amount, where = 'wallet') {
+  const d = getEconomy(guildId, userId);
+  const amt = Math.max(0, Math.floor(amount));
+  if (where === 'bank') d.bank   = Math.max(0, (d.bank   ?? 0) - amt);
+  else                  d.wallet = Math.max(0, (d.wallet ?? 0) - amt);
+  await saveEconomy(guildId, userId, d);
+  return d;
+}
+
+export async function transfer(guildId, fromId, toId, amount) {
+  const amt = Math.max(0, Math.floor(amount));
+  const from = getEconomy(guildId, fromId);
+  const to   = getEconomy(guildId, toId);
+  if ((from.wallet ?? 0) < amt) return false;
+  from.wallet = (from.wallet ?? 0) - amt;
+  to.wallet   = (to.wallet   ?? 0) + amt;
+  await saveEconomy(guildId, fromId, from);
+  await saveEconomy(guildId, toId,   to);
+  return true;
 }
 
 export function formatMoney(n) {

@@ -1,12 +1,35 @@
-import { SlashCommandBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder } from 'discord.js';
-import { errorEmbed, successEmbed } from '../../utils/embeds.js';
+/**
+ * partyfinder.js — SkyBot v2 dungeon party finder
+ *
+ * Ported from SkyBot v1 (Discordbot-main/src/commands/Carries/partyfinder.js).
+ * Adapted for v2 conventions (C colors, successEmbed/errorEmbed helpers,
+ * SkyBot v2 • Railway Edition footer, cooldown: 3).
+ *
+ * Subcommands:
+ *   /partyfinder lfg [floor] [class] [ign] [note]
+ *     Posts an LFG listing with a "Join Party" button. Clicking the button
+ *     DMs the poster. Listing auto-expires after 30 minutes (button removed).
+ *
+ *   /partyfinder list
+ *     Shows all currently-active LFG listings.
+ */
+import {
+  SlashCommandBuilder, EmbedBuilder,
+  ButtonBuilder, ButtonStyle, ActionRowBuilder,
+} from 'discord.js';
+import { C, errorEmbed, successEmbed } from '../../utils/embeds.js';
 
-// In-memory party listings (resets on restart — use db for persistence)
-const partyListings = new Map(); // msgId → { owner, floor, classNeeded, ign, note, ts }
+const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
+
+// In-memory party listings (resets on restart — intentional for ephemeral LFG)
+const partyListings = new Map(); // msgId → { owner, floor, cls, ign, note, ts, expiresAt }
 
 const FLOORS = [
-  'E','F1','F2','F3','F4','F5','F6','F7','M1','M2','M3','M4','M5','M6','M7'
+  'E', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7',
+  'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7',
 ];
+
+const LIFETIME_MS = 30 * 60 * 1000; // 30 minutes
 
 export default {
   data: new SlashCommandBuilder()
@@ -34,25 +57,31 @@ export default {
       .setDescription('See active LFG listings')
     ),
 
+  cooldown: 3,
+
   async execute(interaction, client) {
     const sub = interaction.options.getSubcommand();
 
+    // ── LFG ──────────────────────────────────────────────────────────
     if (sub === 'lfg') {
-      const floor     = interaction.options.getString('floor');
-      const cls       = interaction.options.getString('class') ?? 'Any';
-      const ign       = interaction.options.getString('ign') ?? interaction.user.username;
-      const note      = interaction.options.getString('note') ?? '';
+      const floor = interaction.options.getString('floor');
+      const cls   = interaction.options.getString('class') ?? 'Any';
+      const ign   = interaction.options.getString('ign')   ?? interaction.user.username;
+      const note  = interaction.options.getString('note')  ?? '';
+
+      const expiresAt = Date.now() + LIFETIME_MS;
 
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
+        .setColor(C.carry)
         .setTitle(`🗺️ LFG — ${floor}`)
         .addFields(
           { name: 'Posted by',    value: `<@${interaction.user.id}> (${ign})`, inline: true },
-          { name: 'Floor',        value: floor,  inline: true },
-          { name: 'Class Needed', value: cls,    inline: true },
-          { name: 'Note',         value: note || 'None', inline: false },
+          { name: 'Floor',        value: floor,                                 inline: true },
+          { name: 'Class Needed', value: cls,                                   inline: true },
+          { name: 'Note',         value: note || 'None',                        inline: false },
+          { name: 'Expires',      value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: false },
         )
-        .setFooter({ text: 'Click "Join Party" to notify the poster' })
+        .setFooter({ text: 'SkyBot v2 • Railway Edition · Click "Join Party" to notify the poster' })
         .setTimestamp();
 
       const joinBtn = new ButtonBuilder()
@@ -70,17 +99,18 @@ export default {
       partyListings.set(msg.id, {
         owner: interaction.user.id,
         floor, cls, ign, note,
-        ts: Date.now(),
+        ts:        Date.now(),
+        expiresAt,
       });
 
       // Auto-expire after 30 min
       setTimeout(async () => {
         partyListings.delete(msg.id);
         await msg.edit({ components: [] }).catch(() => {});
-      }, 30 * 60 * 1000);
+      }, LIFETIME_MS);
 
       // Handle join button
-      const collector = msg.createMessageComponentCollector({ time: 30 * 60 * 1000 });
+      const collector = msg.createMessageComponentCollector({ time: LIFETIME_MS });
       collector.on('collect', async i => {
         if (i.user.id === interaction.user.id) {
           return i.reply({ content: "You can't join your own party!", flags: [64] });
@@ -89,9 +119,15 @@ export default {
           const owner = await client.users.fetch(interaction.user.id);
           await owner.send({
             embeds: [new EmbedBuilder()
-              .setColor(0x57f287)
+              .setColor(C.success)
               .setTitle('Party Join Request')
               .setDescription(`<@${i.user.id}> (${i.user.username}) wants to join your **${floor}** party!`)
+              .addFields(
+                { name: 'Floor', value: floor, inline: true },
+                { name: 'Class Needed', value: cls, inline: true },
+                { name: 'Note', value: note || 'None', inline: false },
+              )
+              .setFooter(FOOTER)
               .setTimestamp()
             ],
           });
@@ -100,20 +136,40 @@ export default {
           await i.reply({ content: `DM **${ign}** directly to join.`, flags: [64] });
         }
       });
+
+      collector.on('end', async () => {
+        partyListings.delete(msg.id);
+        await msg.edit({ components: [] }).catch(() => {});
+      });
+
+      return;
     }
 
+    // ── LIST ─────────────────────────────────────────────────────────
     if (sub === 'list') {
-      if (!partyListings.size) {
-        return interaction.reply({ embeds: [errorEmbed('No Listings', 'No active LFG listings right now. Create one with `/partyfinder lfg`!')] });
+      // Purge expired listings before showing
+      const now = Date.now();
+      for (const [id, l] of partyListings.entries()) {
+        if (l.expiresAt <= now) partyListings.delete(id);
       }
+
+      if (!partyListings.size) {
+        return interaction.reply({
+          embeds: [errorEmbed('No Listings', 'No active LFG listings right now. Create one with `/partyfinder lfg`!')],
+        });
+      }
+
       const lines = [...partyListings.values()].map(l =>
-        `**${l.floor}** — <@${l.owner}> (${l.ign}) | Class: ${l.cls} | ${l.note || 'No note'}`
+        `**${l.floor}** — <@${l.owner}> (${l.ign}) | Class: ${l.cls} | ${l.note || 'No note'} | expires <t:${Math.floor(l.expiresAt / 1000)}:R>`
       );
+
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
+        .setColor(C.carry)
         .setTitle('🗺️ Active LFG Listings')
         .setDescription(lines.join('\n'))
+        .setFooter(FOOTER)
         .setTimestamp();
+
       await interaction.reply({ embeds: [embed] });
     }
   },

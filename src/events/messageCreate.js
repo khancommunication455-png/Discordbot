@@ -1,73 +1,49 @@
-import { Events, EmbedBuilder } from 'discord.js';
-import { addXp, getLevelingConfig } from '../utils/levelingUtil.js';
+/**
+ * messageCreate.js — enqueue TTS for messages in watched channels
+ *
+ * If a guild has TTS active and the message is in the watched text channel,
+ * the message is enqueued for speaking. Bot messages and commands are skipped.
+ *
+ * If AI mode is on and the message mentions the bot OR starts with "ai ",
+ * it's treated as an AI prompt (response is generated + spoken).
+ */
+import { getTTSState, enqueueTTS } from '../services/ttsService.js';
 import { getDb } from '../utils/db.js';
-import { enqueueTTS, getTTSState } from '../services/ttsService.js';
 
 export default {
-  name: Events.MessageCreate,
+  name: 'messageCreate',
   async execute(message, client) {
     if (message.author.bot) return;
-    if (!message.guild)     return;
+    if (!message.guild) return; // DMs
 
-    const guildId = message.guildId;
-    const db      = getDb();
+    const state = getTTSState(message.guild.id);
+    if (!state) return;
 
-    // ── Custom Commands ────────────────────────────────────────────────
-    const cfg    = db.data.guildConfig?.[guildId];
-    const prefix = cfg?.prefix ?? '!';
-    const lower  = message.content.toLowerCase().trim();
+    // Only read messages in the watched text channel
+    if (message.channelId !== state.textChannelId) return;
 
-    // Check custom commands
-    if (cfg?.customCmds) {
-      for (const [trigger, cmd] of Object.entries(cfg.customCmds)) {
-        if (lower === trigger || lower.startsWith(trigger + ' ')) {
-          const embed = new EmbedBuilder().setColor(cmd.color ?? 0x5865f2).setTimestamp();
-          if (cmd.title)    embed.setTitle(cmd.title);
-          if (cmd.response) embed.setDescription(cmd.response);
-          await message.channel.send({ embeds: [embed] }).catch(() => {});
-          return;
-        }
-      }
+    // Skip command prefixes
+    if (message.content.startsWith('/')) return;
+    if (message.content.startsWith('!')) return;
+
+    const db = getDb();
+    const aiMode = db.ttsAIMode?.[message.guild.id] ?? state.aiMode ?? false;
+
+    // AI trigger: mention bot OR prefix with "ai "
+    const mentionsBot = message.mentions.has(client.user.id);
+    const hasAiPrefix = /^\s*ai\s+/i.test(message.content);
+
+    if (aiMode && (mentionsBot || hasAiPrefix)) {
+      const cleanedText = message.content
+        .replace(/<@!?\d+>/g, '')
+        .replace(/^\s*ai\s+/i, '')
+        .trim();
+      if (!cleanedText) return;
+      await enqueueTTS(message.guild, cleanedText, message.author.username, true);
+      return;
     }
 
-    // ── TTS ────────────────────────────────────────────────────────────
-    // Works in any text channel that has been configured as a TTS channel
-    const ttsChannelId = db.data.ttsChannels?.[guildId];
-    if (ttsChannelId && message.channelId === ttsChannelId) {
-      const state = getTTSState(guildId);
-      if (state) {
-        await enqueueTTS(
-          message.guild,
-          message.content,
-          message.member?.displayName ?? message.author.username
-        ).catch(err => console.error('[TTS] Enqueue error:', err.message));
-      }
-    }
-
-    // ── XP Leveling ────────────────────────────────────────────────────
-    const config = getLevelingConfig(guildId);
-    if (config?.enabled) {
-      try {
-        const result = await addXp(guildId, message.author.id, client);
-        if (result?.leveledUp) {
-          const lvlChannel = config.channelId
-            ? message.guild.channels.cache.get(config.channelId) ?? message.channel
-            : message.channel;
-          const lvlMsg = (config.message ?? '🎉 {user} leveled up to **Level {level}**!')
-            .replace('{user}',  `<@${message.author.id}>`)
-            .replace('{level}', result.level);
-          await lvlChannel.send({
-            embeds: [new EmbedBuilder()
-              .setColor(0xffd700)
-              .setDescription(lvlMsg)
-              .setThumbnail(message.author.displayAvatarURL())
-              .setTimestamp()
-            ],
-          }).catch(() => {});
-        }
-      } catch (err) {
-        console.error('[XP] Error:', err.message);
-      }
-    }
+    // Normal read mode (or AI mode without trigger): read message aloud
+    await enqueueTTS(message.guild, message.content, message.author.username, false);
   },
 };
