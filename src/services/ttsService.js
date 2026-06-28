@@ -331,13 +331,8 @@ function createTranscoder() {
 
 /**
  * Play an MP3 buffer in the guild's voice channel.
- *
- * Pipeline: MP3 buffer → ffmpeg stdin → ffmpeg decodes to raw PCM 48k stereo
- *           → ffmpeg stdout → createAudioResource(StreamType.Raw) →
- *           @discordjs/voice encodes to opus via @discordjs/opus → Discord
- *
+ * Pipes MP3 → prism FFmpeg → 48k PCM → @discordjs/voice audio resource.
  * Resolves when the player returns to Idle, rejects on error.
- *
  * @param {Object} state
  * @param {Buffer} mp3Buffer
  * @returns {Promise<void>}
@@ -351,124 +346,47 @@ function playMP3(state, mp3Buffer) {
       err ? reject(err) : resolve();
     };
 
-    console.log(`[TTS] playMP3: MP3 buffer is ${mp3Buffer.length} bytes`);
-
-    // ── Spawn ffmpeg directly (more reliable than prism-media on Railway) ──
-    // ffmpeg reads MP3 from stdin, outputs raw s16le 48kHz stereo PCM to stdout.
-    // @discordjs/voice then encodes this PCM → opus using @discordjs/opus.
-    let ffmpegProc;
+    let transcoder;
     try {
-      ffmpegProc = spawn(FFMPEG, [
-        '-i',            'pipe:0',    // read MP3 from stdin
-        '-analyzeduration', '0',       // skip probe delay
-        '-loglevel',     'error',     // suppress info logs
-        '-f',            's16le',     // raw signed 16-bit little-endian
-        '-ar',           '48000',     // 48kHz (Discord requirement)
-        '-ac',           '2',         // stereo
-        'pipe:1',                     // write PCM to stdout
-      ], { stdio: ['pipe', 'pipe', 'pipe'] });
+      transcoder = createTranscoder();
     } catch (e) {
-      console.error('[TTS] Failed to spawn ffmpeg:', e.message);
+      console.error('[TTS] FFmpeg transcoder spawn failed:', e.message);
       finish(e);
       return;
     }
 
-    let pcmBytes = 0;
-    let stderrBuf = '';
-
-    // Track PCM data flowing through the pipeline
-    ffmpegProc.stdout.on('data', (chunk) => {
-      pcmBytes += chunk.length;
-      if (pcmBytes === chunk.length) {
-        console.log('[TTS] First PCM chunk received from ffmpeg ✅');
-      }
-    });
-
-    // Capture stderr for debugging
-    ffmpegProc.stderr.on('data', (chunk) => {
-      stderrBuf += chunk.toString();
-    });
-
-    ffmpegProc.on('error', (err) => {
-      console.error('[TTS] ffmpeg process error:', err.message);
+    // prism-media's FFmpeg is a Duplex: write MP3 to it, read PCM from it.
+    transcoder.on('error', (err) => {
+      console.error('[TTS] Transcoder error:', err.message);
       finish(err);
     });
 
-    ffmpegProc.on('close', (code) => {
-      if (code !== 0 && code !== null) {
-        console.error(`[TTS] ffmpeg exited with code ${code}`);
-        if (stderrBuf) console.error('[TTS] ffmpeg stderr:', stderrBuf.slice(0, 500));
-        finish(new Error(`ffmpeg exited ${code}`));
-        return;
-      }
-      console.log(`[TTS] ffmpeg finished: produced ${pcmBytes} bytes of PCM`);
-    });
-
-    // ── Write MP3 buffer to ffmpeg's stdin ──
+    // Feed the MP3 buffer into the transcoder's stdin.
     try {
-      ffmpegProc.stdin.write(mp3Buffer);
-      ffmpegProc.stdin.end();
-      console.log('[TTS] MP3 buffer written to ffmpeg stdin ✅');
+      transcoder.write(mp3Buffer);
+      transcoder.end();
     } catch (e) {
-      console.error('[TTS] Failed to write to ffmpeg stdin:', e.message);
+      console.error('[TTS] Failed to feed transcoder:', e.message);
       finish(e);
       return;
     }
 
-    // ── Create audio resource from ffmpeg's PCM stdout ──
-    // StreamType.Raw = raw PCM (s16le 48k stereo)
-    // inlineVolume: false = no opusscript dependency (uses @discordjs/opus)
-    const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType:     StreamType.Raw,
-      inlineVolume:  false,
+    // Build the audio resource — Raw PCM, NO inlineVolume (Railway-safe).
+    const resource = createAudioResource(transcoder, {
+      inputType:      StreamType.Raw,
+      inlineVolume:   false,  // CRITICAL: avoids opusscript native binding
     });
 
-    // ── Track player status transitions for diagnostics ──
-    const statusHandler = (oldState, newState) => {
-      console.log(`[TTS] Player: ${oldState.status} → ${newState.status}`);
-      if (newState.status === AudioPlayerStatus.Playing) {
-        console.log('[TTS] Player is now PLAYING ✅ (audio should be audible in VC)');
-      }
-      if (newState.status === AudioPlayerStatus.Idle && oldState.status === AudioPlayerStatus.Playing) {
-        console.log('[TTS] Player finished playback (Idle after Playing)');
-        state.player.off(AudioPlayerStatus.Transitioning, statusHandler);
-        finish();
-      }
-    };
-    state.player.on(AudioPlayerStatus.Transitioning, statusHandler);
+    state.player.once(AudioPlayerStatus.Idle, () => finish());
+    state.player.once('error', (err) => finish(err));
 
-    // Also resolve on direct Idle (in case Transitioning doesn't fire)
-    state.player.once(AudioPlayerStatus.Idle, () => {
-      console.log('[TTS] Player reached Idle');
-      finish();
-    });
-
-    state.player.once('error', (err) => {
-      console.error('[TTS] Player error:', err.message);
-      state.player.off(AudioPlayerStatus.Transitioning, statusHandler);
-      finish(err);
-    });
-
-    // ── Start playback ──
     try {
       state.player.play(resource);
-      console.log('[TTS] player.play() called — waiting for audio to play...');
+      console.log('[TTS] player.play() called (Raw PCM 48k stereo via prism-media FFmpeg)');
     } catch (e) {
       console.error('[TTS] player.play() threw:', e.message);
       finish(e);
     }
-
-    // ── Safety timeout: if nothing happens in 15s, something is wrong ──
-    setTimeout(() => {
-      if (!settled) {
-        console.error('[TTS] TIMEOUT: No playback after 15s');
-        console.error(`[TTS]   PCM produced: ${pcmBytes} bytes`);
-        console.error(`[TTS]   ffmpeg alive: ${ffmpegProc.killed ? 'NO (killed)' : 'yes'}`);
-        console.error('[TTS]   Player status:', state.player.state?.status);
-        if (stderrBuf) console.error('[TTS]   ffmpeg stderr:', stderrBuf.slice(0, 300));
-        finish(new Error('TTS playback timeout — check logs above'));
-      }
-    }, 15_000);
   });
 }
 
@@ -771,8 +689,14 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
 
   const connection = await buildConnection(guild.id, voiceChannelId, guild.voiceAdapterCreator);
 
+  // CRITICAL: Use NoSubscriberBehavior.Play, NOT Pause.
+  // With Pause, the player auto-pauses if the voice connection's subscription
+  // isn't fully active when play() is called — this manifests as
+  // "Player status: autopaused" and NO audio comes out (the #1 TTS bug).
+  // With Play, the player keeps playing even if the subscription is momentarily
+  // missing, and audio reaches Discord once the subscription catches up.
   const player = createAudioPlayer({
-    behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+    behaviors: { noSubscriber: NoSubscriberBehavior.Play },
   });
   connection.subscribe(player);
 

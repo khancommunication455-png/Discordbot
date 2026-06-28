@@ -7,7 +7,6 @@
  * All endpoints return JSON. Auth via DASHBOARD_TOKEN (Bearer header) if set.
  */
 import express from 'express';
-import { REST, Routes } from 'discord.js';
 import { getDb, saveDb, addSubscription, removeSubscription, getAllSubscribers } from '../utils/db.js';
 import { getFlipWatcherStats, getRecentFlips, getTopFlips, searchFlips, forceScan, postTestFlip } from '../services/ahFlipWatcher.js';
 import { getAuctionSoldStats } from '../services/auctionSoldWatcher.js';
@@ -15,45 +14,32 @@ import { getAllTTSStates } from '../services/ttsService.js';
 import { exportSnapshot, getStats as getPriceStats, getMarketPrice } from '../services/priceHistory.js';
 import { getAllConfig, getConfig, getConfigSource, setConfig, updateConfig, DEFAULTS } from '../utils/runtimeConfig.js';
 import { getAutoDeployStatus, autoDeployCommands } from '../utils/autoDeploy.js';
-import {
-  CARRY_CATEGORIES, ensureGuildConfig, getAllCategories, getCategory, getItem,
-  setCategoryChannel, setItemPrice, setItemEnabled,
-} from '../utils/carryConfig.js';
-import { postCarryPanel } from '../commands/Carries/carry.js';
 
 export function startWebDashboard(client) {
   const app = express();
   app.use(express.json());
 
-  // ── CORS — allows the dashboard (Vercel) to call the bot (Railway) ──
-  // In production, the dashboard runs on a different domain than the bot.
-  // Without CORS, browsers block cross-origin requests.
-  //
-  // We ALWAYS set Access-Control-Allow-Origin to the requesting origin
-  // (or * if no origin header). The bot's API doesn't expose sensitive
-  // data without DASHBOARD_TOKEN auth, so allowing all origins is safe.
+  // ── CORS — allows Vercel dashboard to call Railway bot ──
   app.use((req, res, next) => {
     const origin = req.headers.origin;
-
     if (origin) {
-      // Echo the requesting origin back — allows any dashboard to connect
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
     } else {
-      // No Origin header (curl, server-to-server) — allow all
       res.setHeader('Access-Control-Allow-Origin', '*');
     }
-
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Max-Age', '86400'); // 24h preflight cache
-
-    // Handle preflight OPTIONS requests
-    if (req.method === 'OPTIONS') {
-      return res.status(204).end();
-    }
+    res.setHeader('Access-Control-Max-Age', '86400');
+    if (req.method === 'OPTIONS') return res.status(204).end();
     next();
+  });
+
+  // ── Root status page ──
+  app.get('/', (req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SkyBot v2</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0a0e14;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{max-width:500px;width:100%;background:#111827;border:1px solid #1e293b;border-radius:16px;padding:40px;box-shadow:0 8px 32px rgba(0,0,0,.4)}.logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00D4AA,#00796B);display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:20px}h1{font-size:1.4rem;margin-bottom:8px}.status{display:flex;align-items:center;gap:8px;padding:12px 16px;background:#064e3b;border-radius:8px;margin-bottom:20px;color:#34d399;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#34d399;animation:p 2s infinite}@keyframes p{0%,100%{opacity:1}50%{opacity:.5}}.stat{background:#1e293b;border-radius:8px;padding:12px;margin-bottom:8px}.label{font-size:.7rem;text-transform:uppercase;color:#64748b}.val{font-size:1.1rem;font-weight:700;margin-top:4px}a{color:#00D4AA}</style></head><body><div class="card"><div class="logo">🤖</div><h1>SkyBot v2 <span style="font-size:.7rem;color:#00D4AA">Railway Edition</span></h1><div class="status"><span class="dot"></span> Bot is online</div><div class="stat"><div class="label">Uptime</div><div class="val">${Math.floor(process.uptime()/3600)}h ${Math.floor(process.uptime()%3600/60)}m</div></div><div class="stat"><div class="label">Health Check</div><div class="val"><a href="/health">/health</a> | <a href="/api/stats">/api/stats</a></div></div></div></body></html>`);
   });
 
   // Simple token auth (optional)
@@ -67,121 +53,6 @@ export function startWebDashboard(client) {
     }
     next();
   }
-
-  // ── Root status page (no auth) ──────────────────────────────
-  // Shows a simple HTML status page when someone visits the Railway URL
-  // in a browser. Without this, visiting / returns "Cannot GET /".
-  app.get('/', (req, res) => {
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime / 3600);
-    const mins = Math.floor((uptime % 3600) / 60);
-    const secs = Math.floor(uptime % 60);
-    const uptimeStr = `${hours}h ${mins}m ${secs}s`;
-
-    res.setHeader('Content-Type', 'text/html');
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SkyBot v2 — API Status</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #0a0e14; color: #e0e0e0; min-height: 100vh;
-      display: flex; align-items: center; justify-content: center; padding: 20px;
-    }
-    .card {
-      max-width: 560px; width: 100%; background: #111827;
-      border: 1px solid #1e293b; border-radius: 16px; padding: 40px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-    }
-    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
-    .logo {
-      width: 48px; height: 48px; border-radius: 12px;
-      background: linear-gradient(135deg, #00D4AA, #00796B);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 24px; font-weight: bold; color: white;
-    }
-    h1 { font-size: 1.4rem; font-weight: 700; }
-    .badge {
-      display: inline-block; padding: 2px 10px; border-radius: 999px;
-      font-size: 0.75rem; font-weight: 600; margin-left: 8px;
-      background: rgba(0,212,170,0.15); color: #00D4AA; border: 1px solid rgba(0,212,170,0.3);
-    }
-    .status {
-      display: flex; align-items: center; gap: 8px; padding: 12px 16px;
-      background: #064e3b; border-radius: 8px; margin-bottom: 20px;
-      font-weight: 600; color: #34d399;
-    }
-    .dot {
-      width: 10px; height: 10px; border-radius: 50%; background: #34d399;
-      animation: pulse 2s infinite;
-    }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
-    .stat {
-      background: #1e293b; border-radius: 8px; padding: 12px 16px;
-    }
-    .stat-label { font-size: 0.7rem; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px; }
-    .stat-value { font-size: 1.1rem; font-weight: 700; margin-top: 4px; }
-    .endpoints { margin-top: 20px; }
-    .endpoints h2 { font-size: 0.9rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
-    .endpoint {
-      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-      background: #0f172a; border-radius: 6px; margin-bottom: 6px;
-      font-family: 'SF Mono', Monaco, monospace; font-size: 0.85rem;
-    }
-    .method { color: #00D4AA; font-weight: 700; min-width: 40px; }
-    .path { color: #93c5fd; }
-    .desc { color: #64748b; font-size: 0.75rem; margin-left: auto; }
-    a { color: #00D4AA; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .footer { margin-top: 24px; font-size: 0.75rem; color: #475569; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="header">
-      <div class="logo">🤖</div>
-      <div>
-        <h1>SkyBot v2 <span class="badge">Railway Edition</span></h1>
-        <div style="font-size:0.8rem;color:#64748b;">Hypixel Skyblock Discord Bot</div>
-      </div>
-    </div>
-    <div class="status">
-      <span class="dot"></span>
-      Bot is online and running
-    </div>
-    <div class="grid">
-      <div class="stat">
-        <div class="stat-label">Uptime</div>
-        <div class="stat-value">${uptimeStr}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">API Port</div>
-        <div class="stat-value">${process.env.PORT || 8080}</div>
-      </div>
-    </div>
-    <div class="endpoints">
-      <h2>API Endpoints</h2>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/health</span><span class="desc">Health check (JSON)</span></div>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/api/stats</span><span class="desc">Bot overview stats</span></div>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/api/flips/recent</span><span class="desc">Recent flips</span></div>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/api/flips/top</span><span class="desc">Top all-time flips</span></div>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/api/config</span><span class="desc">Bot configuration</span></div>
-      <div class="endpoint"><span class="method">GET</span><span class="path">/api/tts/sessions</span><span class="desc">Active TTS sessions</span></div>
-    </div>
-    <div class="footer">
-      This is the bot's REST API server. The control dashboard is a separate<br>
-      deployment (Vercel) that calls these endpoints.<br><br>
-      Set <code>NEXT_PUBLIC_BOT_API_URL</code> on Vercel to this URL.
-    </div>
-  </div>
-</body>
-</html>`);
-  });
 
   // ── Health check (no auth) ──────────────────────────────────
   app.get('/health', (req, res) => {
@@ -481,220 +352,6 @@ export function startWebDashboard(client) {
         linkedAt: info.linkedAt,
       }));
       res.json({ players: list });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Carry system (per-category channel design) ──────────────
-  // GET /api/carry/categories?guildId=<id>
-  //   Returns all 5 carry categories with guild overrides applied.
-  //   If no guildId is provided, returns the default catalog (no overrides).
-  app.get('/api/carry/categories', auth, (req, res) => {
-    try {
-      const guildId = (req.query.guildId || '').toString();
-      if (!guildId) {
-        // Defaults only (no guild overrides)
-        return res.json({
-          guildId: null,
-          categories: Object.fromEntries(
-            Object.entries(CARRY_CATEGORIES).map(([id, def]) => [
-              id,
-              {
-                ...def,
-                channelId:      null,
-                enabled:        true,
-                panelMessageId: null,
-                items: def.items.map(it => ({ ...it, enabled: true })),
-              },
-            ]),
-          ),
-        });
-      }
-      ensureGuildConfig(guildId);
-      res.json({ guildId, categories: getAllCategories(guildId) });
-    } catch (err) {
-      console.error('[Web] /api/carry/categories error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // POST /api/carry/channel   body: { guildId, categoryId, channelId }
-  //   Sets the Discord channel for a carry category.
-  app.post('/api/carry/channel', auth, async (req, res) => {
-    try {
-      const { guildId, categoryId, channelId } = req.body || {};
-      if (!guildId || !categoryId || !channelId) {
-        return res.status(400).json({ error: 'guildId, categoryId, channelId required' });
-      }
-      if (!CARRY_CATEGORIES[categoryId]) {
-        return res.status(400).json({ error: `Unknown categoryId: ${categoryId}` });
-      }
-      ensureGuildConfig(guildId);
-      const ok = setCategoryChannel(guildId, categoryId, channelId);
-      if (!ok) return res.status(400).json({ error: 'Failed to set channel' });
-      res.json({
-        ok,
-        categoryId,
-        channelId,
-        category: getCategory(guildId, categoryId),
-      });
-    } catch (err) {
-      console.error('[Web] /api/carry/channel error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // POST /api/carry/price   body: { guildId, itemId, price }
-  //   Overrides a carry item's price.
-  app.post('/api/carry/price', auth, async (req, res) => {
-    try {
-      const { guildId, itemId, price } = req.body || {};
-      if (!guildId || !itemId || !price) {
-        return res.status(400).json({ error: 'guildId, itemId, price required' });
-      }
-      ensureGuildConfig(guildId);
-      const ok = setItemPrice(guildId, itemId, String(price));
-      if (!ok) return res.status(400).json({ error: `Unknown itemId: ${itemId}` });
-      res.json({ ok, itemId, price: String(price), item: getItem(guildId, itemId) });
-    } catch (err) {
-      console.error('[Web] /api/carry/price error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // POST /api/carry/panel   body: { guildId, categoryId }
-  //   Posts/refreshes the carry panel in the category's channel.
-  //   Returns { ok, messageId, channelId } or { error: 'channel not set' }.
-  app.post('/api/carry/panel', auth, async (req, res) => {
-    try {
-      const { guildId, categoryId } = req.body || {};
-      if (!guildId || !categoryId) {
-        return res.status(400).json({ error: 'guildId, categoryId required' });
-      }
-      if (!CARRY_CATEGORIES[categoryId]) {
-        return res.status(400).json({ error: `Unknown categoryId: ${categoryId}` });
-      }
-      ensureGuildConfig(guildId);
-      const category = getCategory(guildId, categoryId);
-      if (!category?.channelId) {
-        return res.status(400).json({ error: 'channel not set' });
-      }
-      const result = await postCarryPanel(client, guildId, categoryId);
-      if (!result) {
-        return res.status(500).json({ error: 'Failed to post panel (channel not reachable)' });
-      }
-      res.json({ ok: true, ...result });
-    } catch (err) {
-      console.error('[Web] /api/carry/panel error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // POST /api/carry/toggle   body: { guildId, itemId, enabled }
-  //   Enable/disable a specific carry item.
-  app.post('/api/carry/toggle', auth, async (req, res) => {
-    try {
-      const { guildId, itemId, enabled } = req.body || {};
-      if (!guildId || !itemId || typeof enabled !== 'boolean') {
-        return res.status(400).json({ error: 'guildId, itemId, enabled (boolean) required' });
-      }
-      ensureGuildConfig(guildId);
-      const ok = setItemEnabled(guildId, itemId, enabled);
-      if (!ok) return res.status(400).json({ error: `Unknown itemId: ${itemId}` });
-      res.json({ ok, itemId, enabled, item: getItem(guildId, itemId) });
-    } catch (err) {
-      console.error('[Web] /api/carry/toggle error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Bot launch readiness check ──────────────────────────────
-  // Returns a checklist of what's configured vs missing, so the dashboard
-  // can show a "Run Bot" button that's only enabled when everything's ready.
-  app.get('/api/launch/status', auth, (req, res) => {
-    try {
-      const db = getDb();
-      const carryCfg = db.carryConfig || {};
-      const guildIds = Object.keys(carryCfg).filter(gid => {
-        const cats = carryCfg[gid]?.categories || {};
-        return Object.values(cats).some(c => c.channelId);
-      });
-
-      const checks = {
-        discordToken:    !!process.env.DISCORD_TOKEN,
-        clientId:        !!process.env.CLIENT_ID,
-        hypixelApiKey:   !!process.env.HYPIXEL_API_KEY,
-        groqApiKey:      !!process.env.GROQ_API_KEY,
-        flipChannelId:   !!getConfig('AH_FLIP_CHANNEL_ID'),
-        carryChannelsSet: guildIds.length > 0,
-        commandsRegistered: db.firstRun?.commandsRegistered ?? false,
-        welcomePosted:   db.firstRun?.welcomePosted ?? false,
-      };
-
-      const criticalMissing = [];
-      if (!checks.discordToken)  criticalMissing.push('DISCORD_TOKEN');
-      if (!checks.clientId)      criticalMissing.push('CLIENT_ID');
-      if (!checks.hypixelApiKey) criticalMissing.push('HYPIXEL_API_KEY');
-      if (!checks.flipChannelId) criticalMissing.push('AH_FLIP_CHANNEL_ID');
-
-      const ready = criticalMissing.length === 0;
-      const botRunning = !!process.env.DISCORD_TOKEN;
-
-      res.json({
-        ready,
-        botRunning,
-        checks,
-        criticalMissing,
-        optionalMissing: !checks.groqApiKey ? ['GROQ_API_KEY (for AI mode)'] : [],
-        carryGuildCount: guildIds.length,
-        message: ready
-          ? (botRunning ? 'Bot is running!' : 'All config ready — set DISCORD_TOKEN in Railway env vars and deploy to start the bot.')
-          : `Missing critical env vars: ${criticalMissing.join(', ')}. Set these in your Railway environment variables.`,
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Validate a DISCORD_TOKEN without restarting ─────────────
-  // POST /api/launch/validate-token  body: { token }
-  // Returns { valid, botTag, botId } or { valid: false, error }
-  // Does NOT store the token — just validates it for the dashboard.
-  app.post('/api/launch/validate-token', auth, async (req, res) => {
-    try {
-      const { token } = req.body || {};
-      if (!token || typeof token !== 'string') {
-        return res.status(400).json({ valid: false, error: 'Token required' });
-      }
-      // Validate by fetching the bot's application info
-      const rest = new REST({ version: '10' }).setToken(token);
-      try {
-        const app = await rest.get(Routes.oauth2CurrentApplication());
-        const user = await rest.get(Routes.user());
-        res.json({
-          valid: true,
-          botTag: user?.username ? `${user.username}#${user.discriminator || '0'}` : user?.username,
-          botId: user?.id,
-          appName: app?.name,
-        });
-      } catch (err) {
-        res.json({ valid: false, error: err.message?.slice(0, 200) || 'Invalid token' });
-      }
-    } catch (err) {
-      res.status(500).json({ valid: false, error: err.message });
-    }
-  });
-
-  // ─­─ Get all carry categories with full item details ────────
-  // Returns the merged category config (defaults + guild overrides)
-  app.get('/api/carry/categories', auth, (req, res) => {
-    try {
-      const guildId = (req.query.guildId || '').toString();
-      res.json({
-        categories: getAllCategories(guildId),
-        defaults: CARRY_CATEGORIES,
-      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

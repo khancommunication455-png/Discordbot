@@ -1,17 +1,11 @@
 # ─────────────────────────────────────────────────────────────
 # SkyBot v2 — Railway Nixpacks Config
 # ─────────────────────────────────────────────────────────────
-# Packages installed:
-#   - nodejs_20       : runtime
-#   - ffmpeg-headless : TTS + music audio transcoding
-#   - yt-dlp          : /music + /download (YouTube, TikTok, etc.)
-#   - python3         : needed by node-gyp to compile @discordjs/opus
-#                       (native opus encoder for Discord voice)
-#   - gcc             : C compiler for native module compilation
-#   - make            : build tool for native modules
+# Key change from v1: NO Python venv, NO edge-tts binary.
+# All TTS is done via pure HTTP (Google TTS / StreamElements / VoiceRSS)
+# and encoded to opus using @discordjs/voice's built-in prism-media
+# (FFmpeg transcoder). This removes the #1 cause of Railway TTS failures.
 # ─────────────────────────────────────────────────────────────
-
-# SkyBot v2 — Railway Nixpacks Config
 
 [phases.setup]
 nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python3", "gcc", "gnumake"]

@@ -1,27 +1,14 @@
 /**
  * download.js — SkyBot v2 Social Media Downloader (yt-dlp powered)
- * =================================================================
  *
- * Downloads video/audio from YouTube, TikTok, Instagram, Twitter/X,
- * Reddit, Facebook, and 1000+ other sites supported by yt-dlp.
+ * Supports YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, +1000 more.
+ * Quality: best/1080p/720p/480p/audio
  *
- * Quality options: best / 1080p / 720p / 480p / audio (MP3)
- *
- * Flow:
- *   1. /download <url> [quality] → deferReply → "Downloading..." embed
- *   2. yt-dlp downloads to tmp/dl_<ts>.<ext> (--max-filesize 24M to stay
- *      under Discord's free-tier 25MB upload limit)
- *   3. File attached + "Download Complete" embed
- *   4. File deleted from tmp/ after 30s
- *
- * yt-dlp is auto-detected from common Railway/Termux/Linux paths. If
- * missing, a one-shot runtime install is attempted (pip → direct binary
- * download) so the command works on dev machines without nixpacks.
- *
- * Footer "SkyBot v2 • Railway Edition"; cooldown: 3.
+ * YouTube bot-detection bypass: tries 4 player clients (web_safari, web, android, ios)
+ * Discord 25MB limit enforced AFTER successful download.
  */
 import { SlashCommandBuilder, AttachmentBuilder, EmbedBuilder } from 'discord.js';
-import { existsSync, unlinkSync, mkdirSync, readdirSync, chmodSync, statSync } from 'fs';
+import { existsSync, unlinkSync, mkdirSync, readdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { exec, execSync } from 'child_process';
@@ -29,203 +16,154 @@ import { promisify } from 'util';
 import { C } from '../../utils/embeds.js';
 
 const execAsync = promisify(exec);
-const __dirname  = dirname(fileURLToPath(import.meta.url));
-const TMP_DIR    = join(__dirname, '../../../tmp');
-const BIN_DIR    = join(__dirname, '../../../bin');
-if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
-if (!existsSync(BIN_DIR)) mkdirSync(BIN_DIR, { recursive: true });
-
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TMP_DIR = join(__dirname, '../../../tmp');
 const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
-const DISCORD_MAX_BYTES = 25 * 1024 * 1024;  // 25MB — Discord free-tier limit
+const DISCORD_MAX_BYTES = 25 * 1024 * 1024; // 25MB
 
-// ── Find yt-dlp — checks PATH, pip locations, and our local bin ──────────
+if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
+
+// ── Find yt-dlp ──
 function findYtDlp() {
-  const candidates = [
-    'yt-dlp',                                              // PATH
-    '/root/.nix-profile/bin/yt-dlp',                       // Railway nixpacks
-    '/nix/var/nix/profiles/default/bin/yt-dlp',
-    '/usr/local/bin/yt-dlp',                              // pip global
-    '/usr/bin/yt-dlp',
-    '/root/.local/bin/yt-dlp',                            // pip user Railway
-    '/home/user/.local/bin/yt-dlp',
-    join(BIN_DIR, 'yt-dlp'),                              // our downloaded binary
-    '/data/data/com.termux/files/usr/bin/yt-dlp',        // Termux
-  ];
-
-  for (const c of candidates) {
+  const paths = ['yt-dlp', '/root/.nix-profile/bin/yt-dlp', '/usr/bin/yt-dlp', '/usr/local/bin/yt-dlp', '/nix/var/nix/profiles/default/bin/yt-dlp'];
+  for (const p of paths) {
     try {
-      const bin = c === 'yt-dlp' ? c : (existsSync(c) ? c : null);
-      if (!bin) continue;
-      execSync(`"${bin}" --version`, { stdio: 'pipe', timeout: 5000 });
-      return bin;
-    } catch { /* ignore */ }
+      if (p === 'yt-dlp') { execSync('yt-dlp --version', { stdio: 'pipe', timeout: 5000 }); return p; }
+      if (existsSync(p)) return p;
+    } catch {}
   }
-  return null;
+  return 'yt-dlp';
 }
+const ytdlp = findYtDlp();
 
-// Install yt-dlp at runtime if missing (dev / non-nixpacks envs).
-async function ensureYtDlp() {
-  const existing = findYtDlp();
-  if (existing) return existing;
-
-  console.log('[Download] yt-dlp not found, installing...');
-
-  // Try pip
-  try {
-    await execAsync('pip install yt-dlp 2>&1 || pip3 install yt-dlp 2>&1', { timeout: 60_000 });
-    const found = findYtDlp();
-    if (found) { console.log('[Download] yt-dlp installed via pip'); return found; }
-  } catch { /* ignore */ }
-
-  // Download binary directly
-  try {
-    const dest = join(BIN_DIR, 'yt-dlp');
-    await execAsync(
-      `curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o "${dest}"`,
-      { timeout: 60_000 },
-    );
-    chmodSync(dest, 0o755);
-    console.log('[Download] yt-dlp binary downloaded');
-    return dest;
-  } catch { /* ignore */ }
-
-  return null;
-}
+// ── Player clients for YouTube bot bypass ──
+const PLAYER_CLIENTS = ['web_safari', 'web', 'android', 'ios'];
 
 export default {
   data: new SlashCommandBuilder()
     .setName('download')
-    .setDescription('Download video from YouTube, TikTok, Instagram, Twitter/X, Reddit + 1000 more sites')
-    .addStringOption((o) =>
-      o.setName('url').setDescription('Video URL').setRequired(true))
-    .addStringOption((o) =>
-      o.setName('quality')
-        .setDescription('Quality preset')
-        .setRequired(false)
-        .addChoices(
-          { name: '🏆 Best quality',    value: 'best'  },
-          { name: '📺 1080p',           value: '1080'  },
-          { name: '📺 720p',            value: '720'   },
-          { name: '📺 480p',            value: '480'   },
-          { name: '🎵 Audio only MP3',  value: 'audio' },
-        )),
-  cooldown: 3,
+    .setDescription('Download a video/audio from social media')
+    .addStringOption(o => o.setName('url').setDescription('Video URL (YouTube, TikTok, Instagram, etc.)').setRequired(true))
+    .addStringOption(o => o.setName('quality').setDescription('Download quality').setRequired(false)
+      .addChoices(
+        { name: 'Best available', value: 'best' },
+        { name: '1080p', value: '1080' },
+        { name: '720p', value: '720' },
+        { name: '480p', value: '480' },
+        { name: 'Audio only (MP3)', value: 'audio' },
+      )),
 
-  async execute(interaction, client) {
+  cooldown: 5,
+
+  async execute(interaction) {
     await interaction.deferReply();
 
-    const url     = interaction.options.getString('url');
+    const url = interaction.options.getString('url');
     const quality = interaction.options.getString('quality') ?? 'best';
-    const ts      = Date.now();
-    const outTpl  = join(TMP_DIR, `dl_${ts}.%(ext)s`);
+
+    if (!/^https?:\/\//.test(url)) {
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Invalid URL').setDescription('Please provide a valid URL starting with http:// or https://').setFooter(FOOTER).setTimestamp()] });
+    }
+
+    const ts = Date.now();
+    const outTpl = join(TMP_DIR, `dl_${ts}.%(ext)s`);
+
+    await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('⬇️ Downloading...').setDescription(`**URL:** ${url.slice(0, 80)}\n**Quality:** ${quality === 'audio' ? 'MP3 Audio' : quality}\n\nThis may take 10-60 seconds depending on video length.`).setFooter(FOOTER).setTimestamp()] });
+
+    // Build format selector
+    let formatArg;
+    if (quality === 'audio') {
+      formatArg = `-x --audio-format mp3 --audio-quality 0`;
+    } else if (quality === 'best') {
+      formatArg = `-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=webm]/best"`;
+    } else {
+      formatArg = `-f "bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]"`;
+    }
+
+    // Try multiple player clients for YouTube bot bypass
+    let downloadSuccess = false;
+    let lastError = null;
+
+    for (const client of PLAYER_CLIENTS) {
+      const cmd = `"${ytdlp}" ${formatArg} --no-playlist --no-warnings --no-cookies --no-check-certificates --extractor-args "youtube:player_client=${client}" -o "${outTpl}" "${url}"`;
+      try {
+        await execAsync(cmd, { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
+        downloadSuccess = true;
+        console.log(`[Download] yt-dlp succeeded via ${client} client ✅`);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[Download] ${client} client failed: ${String(err.stderr || err.message || err).slice(0, 150)}`);
+        // Clean partial files
+        try { readdirSync(TMP_DIR).filter(f => f.startsWith(`dl_${ts}`)).forEach(f => { try { unlinkSync(join(TMP_DIR, f)); } catch {} }); } catch {}
+      }
+    }
+
+    if (!downloadSuccess) {
+      const errStr = String(lastError?.stderr || lastError?.message || lastError);
+      // Check if it's a YouTube bot block
+      const isBotBlock = errStr.includes('Sign in to confirm') || errStr.includes('not a bot');
+      return interaction.editReply({ embeds: [new EmbedBuilder()
+        .setColor(C.error)
+        .setTitle('❌ Download Failed')
+        .setDescription(isBotBlock
+          ? 'YouTube is blocking the bot from downloading this video. This is a known issue with server IPs. Try a different video or use a direct link.'
+          : `Download failed: ${errStr.slice(0, 300)}`)
+        .setFooter(FOOTER).setTimestamp()] });
+    }
+
+    // Find output file
+    const files = readdirSync(TMP_DIR)
+      .filter(f => f.startsWith(`dl_${ts}`) && !f.endsWith('.part') && !f.endsWith('.ytdl'))
+      .map(f => join(TMP_DIR, f));
+
+    if (!files.length) {
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Download Failed').setDescription('Download completed but output file not found. The video may be too large or in an unsupported format.').setFooter(FOOTER).setTimestamp()] });
+    }
+
+    const filePath = files[0];
+    const ext = filePath.split('.').pop() ?? 'mp4';
+    const fileSize = statSync(filePath).size;
+
+    // Check Discord 25MB limit
+    if (fileSize > DISCORD_MAX_BYTES) {
+      try { unlinkSync(filePath); } catch {}
+      const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
+      const fallback = quality === 'audio'
+        ? `File is **${sizeMB}MB** — exceeds Discord's 25MB limit. Try a shorter clip.`
+        : `File is **${sizeMB}MB** — exceeds Discord's 25MB limit.\nTry \`/download quality:audio\` for a smaller MP3, or pick a lower resolution (480p).`;
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.warning).setTitle('⚠️ File Too Large').setDescription(fallback).setFooter(FOOTER).setTimestamp()] });
+    }
+
+    // Get title (best-effort)
+    let title = 'video';
+    for (const client of PLAYER_CLIENTS) {
+      try {
+        const r = await execAsync(`"${ytdlp}" --get-title --no-playlist --no-cookies --no-check-certificates --extractor-args "youtube:player_client=${client}" "${url}" 2>/dev/null`, { timeout: 10_000 });
+        title = (r.stdout?.trim() || 'video').slice(0, 60);
+        if (title !== 'video') break;
+      } catch {}
+    }
+
+    const safeName = (title || 'video').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'video';
+    const attachment = new AttachmentBuilder(filePath, { name: `${safeName}.${ext}` });
+    const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
 
     await interaction.editReply({
       embeds: [new EmbedBuilder()
-        .setColor(C.info)
-        .setTitle('⬇️ Downloading...')
-        .setDescription(`\`${url.slice(0, 80)}\`\nQuality: **${quality === 'audio' ? 'MP3 Audio' : quality}**`)
+        .setColor(C.success)
+        .setTitle('✅ Download Complete')
+        .setDescription(`**${title}**`)
+        .addFields(
+          { name: 'Quality', value: quality === 'audio' ? 'MP3 Audio' : quality, inline: true },
+          { name: 'Source', value: `[Link](${url})`, inline: true },
+          { name: 'Size', value: `${sizeMB} MB`, inline: true },
+        )
         .setFooter(FOOTER).setTimestamp()],
+      files: [attachment],
     });
 
-    try {
-      const ytdlp = await ensureYtDlp();
-      if (!ytdlp) {
-        return interaction.editReply({
-          embeds: [new EmbedBuilder()
-            .setColor(C.error)
-            .setTitle('yt-dlp Not Available')
-            .setDescription('Could not install yt-dlp on this server.\n\nFor Railway: add `yt-dlp` to your nixpacks.toml under nixPkgs.\nFor Termux: `pkg install yt-dlp`')
-            .setFooter(FOOTER).setTimestamp()],
-        });
-      }
-
-      // Build format selector
-      let formatArg;
-      if (quality === 'audio') {
-        formatArg = `-x --audio-format mp3 --audio-quality 0`;
-      } else if (quality === 'best') {
-        formatArg = `-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=webm]/best"`;
-      } else {
-        formatArg = `-f "bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]"`;
-      }
-
-      // --no-cookies + --extractor-args bypasses YouTube's "Sign in to confirm
-      // you're not a bot" block on Railway/server IPs
-      const cmd = `"${ytdlp}" ${formatArg} --no-playlist --max-filesize 24M --no-warnings --no-cookies --extractor-args "youtube:player_client=web" -o "${outTpl}" "${url}"`;
-
-      // Get title while downloading (best-effort, don't block on it).
-      let title = 'video';
-      execAsync(`"${ytdlp}" --get-title --no-playlist --no-cookies --extractor-args "youtube:player_client=web" "${url}" 2>/dev/null`)
-        .then((r) => { title = (r.stdout?.trim() || 'video').slice(0, 60); })
-        .catch(() => { /* ignore */ });
-
-      await execAsync(cmd, { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
-
-      // Find output file (excludes .part / .ytdl temp files).
-      const files = readdirSync(TMP_DIR)
-        .filter((f) => f.startsWith(`dl_${ts}`) && !f.endsWith('.part') && !f.endsWith('.ytdl'))
-        .map((f) => join(TMP_DIR, f));
-
-      if (!files.length) throw new Error('Download completed but output file not found.');
-
-      const filePath = files[0];
-      const ext      = filePath.split('.').pop() ?? 'mp4';
-      const fileSize = statSync(filePath).size;
-
-      // 25MB Discord free-tier guardrail — offer audio-only fallback
-      if (fileSize > DISCORD_MAX_BYTES) {
-        try { unlinkSync(filePath); } catch { /* ignore */ }
-        const fallback = quality === 'audio'
-          ? 'File exceeds Discord\'s **25MB** upload limit. Try a shorter clip or lower quality.'
-          : 'File exceeds Discord\'s **25MB** upload limit. Try `/download quality:audio` for a much smaller MP3, or pick a lower resolution.';
-        return interaction.editReply({
-          embeds: [new EmbedBuilder()
-            .setColor(C.error)
-            .setTitle('❌ File Too Large')
-            .setDescription(fallback)
-            .setFooter(FOOTER).setTimestamp()],
-        });
-      }
-
-      const safeName   = (title || 'video').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_');
-      const attachment = new AttachmentBuilder(filePath, { name: `${safeName}.${ext}` });
-
-      await interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(C.success)
-          .setTitle('✅ Download Complete')
-          .setDescription(`**${title || url.slice(0, 60)}**`)
-          .addFields(
-            { name: 'Quality',  value: quality === 'audio' ? 'MP3 Audio' : quality, inline: true },
-            { name: 'Source',   value: `[Link](${url})`,                              inline: true },
-            { name: 'Size',     value: `${(fileSize / 1024 / 1024).toFixed(2)} MB`,   inline: true },
-          )
-          .setFooter(FOOTER).setTimestamp()],
-        files: [attachment],
-      });
-
-      // Clean up the temp file after Discord has time to ingest it.
-      setTimeout(() => { try { unlinkSync(filePath); } catch { /* ignore */ } }, 30_000);
-    } catch (err) {
-      let msg = (err.message ?? 'Download failed.').split('\n')[0];
-      if (msg.includes('max-filesize') || msg.includes('larger than'))
-        msg = 'File exceeds Discord\'s **25MB limit**. Try a lower quality or audio only (`/download quality:audio`).';
-      else if (msg.includes('Unsupported URL'))
-        msg = 'This URL is not supported. Try YouTube, TikTok, Instagram, Twitter, Reddit.';
-      else if (msg.includes('Private') || msg.includes('private'))
-        msg = 'This video is private or age-restricted.';
-      else if (msg.includes('not found') || msg.includes('ENOENT'))
-        msg = 'yt-dlp installation failed. Contact the server admin.';
-      else
-        msg = msg.slice(0, 250);
-
-      await interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(C.error)
-          .setTitle('❌ Download Failed')
-          .setDescription(msg)
-          .setFooter(FOOTER).setTimestamp()],
-      });
-    }
+    // Clean up after 30s
+    setTimeout(() => { try { unlinkSync(filePath); } catch {} }, 30_000);
   },
 };
