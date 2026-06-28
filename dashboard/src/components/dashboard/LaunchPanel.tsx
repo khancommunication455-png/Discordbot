@@ -370,7 +370,7 @@ export function LaunchPanel({ initialStatus = null, onMutated }: LaunchPanelProp
                   type={tokenVisible ? 'text' : 'password'}
                   value={tokenDraft}
                   onChange={(e) => setTokenDraft(e.target.value)}
-                  placeholder="Enter your Discord bot token"
+                  placeholder="Paste your bot token here (not stored)"
                   className="h-9 pr-10 font-mono text-xs"
                   aria-label="Discord bot token"
                   autoComplete="off"
