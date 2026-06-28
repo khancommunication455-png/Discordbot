@@ -25,6 +25,40 @@ export function startWebDashboard(client) {
   const app = express();
   app.use(express.json());
 
+  // ── CORS — allows the dashboard (Vercel) to call the bot (Railway) ──
+  // In production, the dashboard runs on a different domain than the bot.
+  // Without CORS, browsers block cross-origin requests.
+  const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      if (ALLOWED_ORIGINS.length === 0) {
+        // No allowlist set — allow all origins (development mode)
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      } else if (ALLOWED_ORIGINS.includes(origin)) {
+        // Origin is in the allowlist — allow it
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+      } else {
+        // Origin not allowed — deny (CORS will block the browser from reading the response)
+        // But still let the request through (non-browser clients like curl ignore CORS)
+      }
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Max-Age', '86400'); // 24h preflight cache
+
+    // Handle preflight OPTIONS requests
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
+
   // Simple token auth (optional)
   const TOKEN = process.env.DASHBOARD_TOKEN;
   function auth(req, res, next) {

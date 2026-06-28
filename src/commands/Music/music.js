@@ -117,7 +117,8 @@ async function getVideoInfo(query) {
 
   const json = await spawnCapture(
     YTDLP,
-    ['-J', '--no-playlist', '--no-warnings', '--no-progress', target],
+    ['-J', '--no-playlist', '--no-warnings', '--no-progress', '--no-cookie',
+     '--extractor-args', 'youtube:player_client=web', target],
     25_000,
   );
   const info = JSON.parse(json);
@@ -142,11 +143,23 @@ async function getVideoInfo(query) {
 }
 
 // ── Resolve direct audio URL via yt-dlp ───────────────────────────────────
+// Uses extractor-args to bypass YouTube's "Sign in to confirm you're not a bot"
+// error that blocks Railway/server IPs. The 'web' player client doesn't
+// trigger the bot check, and --no-cookie prevents cookie prompt errors.
 async function getAudioUrl(videoUrl) {
   const out = await spawnCapture(
     YTDLP,
-    ['-f', 'bestaudio', '-g', '--no-playlist', '--no-warnings', '--no-progress', videoUrl],
-    15_000,
+    [
+      '-f', 'bestaudio',
+      '-g',
+      '--no-playlist',
+      '--no-warnings',
+      '--no-progress',
+      '--no-cookie',
+      '--extractor-args', 'youtube:player_client=web',
+      videoUrl,
+    ],
+    20_000,
   );
   return out.split('\n').map((s) => s.trim()).filter(Boolean)[0] || null;
 }
