@@ -37,7 +37,8 @@ function findYtDlp() {
 const ytdlp = findYtDlp();
 
 // ── Player clients for YouTube bot bypass ──
-const PLAYER_CLIENTS = ['web_safari', 'web', 'android', 'ios'];
+// 'tv' and 'web_embedded' don't require po_token and work on Railway IPs
+const PLAYER_CLIENTS = ['tv', 'web_embedded', 'web_safari', 'web', 'android', 'ios'];
 
 export default {
   data: new SlashCommandBuilder()

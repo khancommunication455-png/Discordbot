@@ -69,7 +69,10 @@ function spawnCapture(bin, args, timeoutMs = 25_000) {
 }
 
 // ── Player clients for YouTube bot bypass ──
-const PLAYER_CLIENTS = ['web_safari', 'web', 'android', 'ios'];
+// 'tv' and 'web_embedded' don't require po_token (Proof of Origin Token)
+// and are the most reliable on server IPs like Railway.
+// Source: yt-dlp GitHub discussions on "Sign in to confirm you're not a bot"
+const PLAYER_CLIENTS = ['tv', 'web_embedded', 'web_safari', 'web', 'android', 'ios'];
 const BASE_ARGS = ['--no-playlist', '--no-warnings', '--no-progress', '--no-cookies', '--no-check-certificates'];
 
 // ── Get video info ──
@@ -297,4 +300,3 @@ export default {
     }
   },
 };
-                   

@@ -451,17 +451,23 @@ async function buildConnection(guildId, voiceChannelId, adapterCreator) {
     selfMute:       false,
   });
 
-  // Wait for Signalling — does NOT require UDP (Ready does, and is slow on Railway).
+  // Try to wait for Ready (includes UDP). If it times out, fall back to Signalling.
   try {
-    await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
-    console.log('[TTS] Signalling state reached ✅');
+    await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+    console.log('[TTS] Ready state reached ✅ (UDP established)');
   } catch {
-    try { connection.destroy(); } catch {}
-    throw new Error('Could not reach Discord voice gateway — check bot Connect + Speak permissions');
+    // Ready timed out — try Signalling (WebSocket only, no UDP)
+    try {
+      await entersState(connection, VoiceConnectionStatus.Signalling, 5_000);
+      console.log('[TTS] Signalling state reached (Ready timed out, proceeding)');
+    } catch {
+      try { connection.destroy(); } catch {}
+      throw new Error('Could not reach Discord voice gateway — check bot Connect + Speak permissions');
+    }
   }
 
-  // Grace sleep: let Railway's UDP negotiate before first audio frame.
-  await sleep(2500);
+  // Grace sleep: let UDP fully negotiate before first audio frame
+  await sleep(3000);
   console.log('[TTS] Connection ready (post-UDP sleep) ✅');
   return connection;
 }
@@ -734,6 +740,30 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
 
   attachConnHandlers(connection, guild.id);
   startKeepAlive(state);
+
+  // ── Play silence warmup to prime the audio pipeline ──
+  // This prevents the "autopaused" issue where the player pauses because
+  // the voice connection isn't fully subscribed when the first TTS plays.
+  // 1 second of silence establishes the audio stream and UDP connection.
+  try {
+    console.log('[TTS] Playing silence warmup to prime audio pipeline...');
+    const warmupProc = spawn(FFMPEG, [
+      '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+      '-t', '1',
+      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    warmupProc.stderr.on('data', () => {});
+    const warmupResource = createAudioResource(warmupProc.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: false,
+    });
+    state.player.play(warmupResource);
+    // Wait for warmup to finish (1s audio + buffer)
+    await sleep(1500);
+    console.log('[TTS] Silence warmup complete ✅ — audio pipeline primed');
+  } catch (err) {
+    console.warn('[TTS] Silence warmup failed (non-fatal):', err.message);
+  }
 
   console.log(`[TTS] setupTTS complete for guild ${guild.id} (aiMode=${aiMode})`);
   return state;

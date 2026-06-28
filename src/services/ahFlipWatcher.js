@@ -118,14 +118,8 @@ export function buildSignature(attrs) {
 
 // ── Main scan loop ────────────────────────────────────────────
 /**
- * Run a single AH scan cycle using the Coflnet Sniper + Sniper Median
- * algorithms.
- *
- * Phase 1: Scan ALL auctions and update price history (builds lowestBin,
- *          secondLowestBin, median per signature).
- * Phase 2: Detect flips — a flip is when cost < lowestBin (Sniper) OR
- *          cost < median * 0.95 (Sniper Median).
- * Phase 3: Post flips to Discord, alert subscribers, update stats.
+ * Run a single AH scan cycle. Fetches auctions, populates price history,
+ * detects flips, posts to channel, alerts subscribers, updates stats.
  *
  * Re-entrancy safe — no-op if a previous scan is still running.
  * Respects rate-limit backoff windows.
@@ -148,7 +142,6 @@ async function runScan() {
 
   let auctions = [];
   try {
-    // Scan ALL pages (not just 3) — Coflnet scans the entire AH
     auctions = await getAllAuctions(C.maxPages);
   } catch (err) {
     state.failedScans++;
@@ -162,31 +155,32 @@ async function runScan() {
     return;
   }
 
-  // ── Phase 1: Build price database (all BINs this scan) ──
-  // startScanEpoch resets lowestBin/secondLowestBin so they get rebuilt
+  // ── Phase 1: Build price database (ALL BINs in this scan) ──
+  // startScanEpoch resets currentPrices so they get rebuilt fresh.
+  // Historical prices (from PREVIOUS scans) are preserved.
   priceHistory.startScanEpoch();
 
   const allBins = [];
   for (const a of auctions) {
     if (!a.bin) continue;
     let attrs;
-    try {
-      attrs = parseItemAttributes(a);
-    } catch { continue; }
+    try { attrs = parseItemAttributes(a); } catch { continue; }
     if (!attrs.name) continue;
-
     const sig = buildSignature(attrs);
     priceHistory.updatePrice(sig, a.starting_bid);
     allBins.push({ auction: a, attrs, sig });
   }
+
+  // finalizeScanEpoch moves currentPrices → historicalPrices
+  // AFTER this, market.median reflects PREVIOUS scans only (not current)
   priceHistory.finalizeScanEpoch();
 
-  // ── Phase 2: Detect flips using Sniper + Sniper Median ──
+  // ── Phase 2: Detect flips using HISTORICAL median vs current cost ──
   const flipsThisCycle = [];
   let binsScanned = 0;
+  const MIN_HISTORICAL_SAMPLES = 5; // Need at least 5 past samples for reliable median
 
   for (const { auction: a, attrs, sig } of allBins) {
-    // Dedup already-seen auctions
     if (state.seenAuctions.has(a.uuid)) continue;
     state.seenAuctions.set(a.uuid, Date.now());
     binsScanned++;
@@ -194,69 +188,30 @@ async function runScan() {
     const market = priceHistory.getMarketPrice(sig);
     if (!market) continue;
 
-    // Need at least 2 samples for reliable lowestBin/median
-    if (market.count < 2) continue;
+    // Need enough HISTORICAL samples for a reliable median
+    if (market.count < MIN_HISTORICAL_SAMPLES) continue;
 
     const cost = a.starting_bid;
-    const lowestBin = market.lowestBin;
-    const secondLowestBin = market.secondLowestBin;
     const median = market.median;
 
-    // ── Sniper algorithm (finder=2) ──
-    // Flip if: cost < lowestBin AND cost < median
-    // (item is the cheapest on the AH AND below median)
-    let isSniper = false;
-    let sniperProfit = 0;
-    if (lowestBin > 0 && cost < lowestBin && median > 0 && cost < median) {
-      isSniper = true;
-      // Profit = secondLowestBin - cost (what you could relist it for)
-      // Fall back to median - cost if no secondLowestBin
-      sniperProfit = secondLowestBin > 0
-        ? (secondLowestBin - cost)
-        : (median - cost);
-    }
+    // Skip if no valid historical median
+    if (median <= 0) continue;
 
-    // ── Sniper Median algorithm (finder=4) ──
-    // Flip if: cost < median * 0.95 (5% below median)
-    // Doesn't need to be below lowestBin
-    let isSniperMedian = false;
-    let sniperMedianProfit = 0;
-    if (median > 0 && cost < median * 0.95) {
-      isSniperMedian = true;
-      sniperMedianProfit = median - cost;
-    }
-
-    // Skip if neither algorithm detected a flip
-    if (!isSniper && !isSniperMedian) continue;
-
-    // Use the better profit estimate
-    let profit = 0;
-    let finder = 0;
-    let finderLabel = '';
-    if (isSniper && sniperProfit >= sniperMedianProfit) {
-      profit = sniperProfit;
-      finder = 2;
-      finderLabel = 'SNIPE';
-    } else {
-      profit = sniperMedianProfit;
-      finder = 4;
-      finderLabel = 'MSNIPE';
-    }
-
-    // Skip if this IS the lowest BIN (can't flip against itself)
-    if (cost === lowestBin && !isSniperMedian) continue;
-
-    const marginPct = (profit / cost) * 100;
+    // ── Sniper Median: flip if cost is 5%+ below historical median ──
+    // This means: the item is priced below what it TYPICALLY sells for
     const marginBelowMedianPct = ((median - cost) / median) * 100;
+    if (marginBelowMedianPct < C.minMarginPct) continue;
 
-    // Apply filters from runtime config
+    // Profit = median - cost (what you could sell it for minus what you pay)
+    const profit = median - cost;
     if (profit < C.minProfit) continue;
-    if (marginPct < C.minMarginPct) continue;
     if (attrs.demandScore < C.minDemand) continue;
 
-    // Volume score: how many samples we have (more = more reliable)
-    const volumeScore = Math.min(100, market.count * 5);
-    // Confidence: weighted blend of volume, demand, and margin
+    // Don't flag items where cost >= median (no actual profit opportunity)
+    if (cost >= median) continue;
+
+    const marginPct = (profit / cost) * 100;
+    const volumeScore = Math.min(100, market.count * 3);
     const confidenceScore = Math.min(
       100,
       Math.round(0.4 * volumeScore + 0.3 * attrs.demandScore + 0.3 * Math.min(100, marginPct * 2))
@@ -267,10 +222,10 @@ async function runScan() {
       itemName: attrs.name,
       tier: attrs.tier,
       buyPrice: cost,
-      lowestBin,
-      secondLowestBin,
+      lowestBin: market.lowestBin,
+      secondLowestBin: market.secondLowestBin,
       median,
-      ewma: market.ewma, // keep for backward compat
+      ewma: market.ewma,
       p5: market.p5,
       profit,
       profitFloor: Math.max(0, market.p5 - cost),
@@ -282,8 +237,8 @@ async function runScan() {
       sampleCount: market.count,
       volume: market.volume,
       signature: sig,
-      finder,
-      finderLabel,
+      finder: 4,
+      finderLabel: 'MSNIPE',
       attrs,
       detectedAt: Date.now(),
     });
@@ -325,7 +280,7 @@ async function runScan() {
 
   state.running = false;
   if (flipsThisCycle.length > 0) {
-    console.log(`[AHFlip] Scan #${state.scansRun}: ${auctions.length} auctions, ${binsScanned} new BINs, ${flipsThisCycle.length} flips (top profit ${formatCoins(flipsThisCycle[0].profit)}) [${flipsThisCycle[0].finderLabel}]`);
+    console.log(`[AHFlip] Scan #${state.scansRun}: ${auctions.length} auctions, ${binsScanned} new BINs, ${flipsThisCycle.length} flips (top profit ${formatCoins(flipsThisCycle[0].profit)})`);
   }
 }
 
@@ -342,46 +297,26 @@ function stripFlip(f) {
     itemName: f.itemName,
     tier: f.tier,
     buyPrice: f.buyPrice,
-    lowestBin: f.lowestBin ?? 0,
-    secondLowestBin: f.secondLowestBin ?? 0,
-    median: f.median ?? f.ewma ?? 0,
-    ewma: f.ewma ?? 0,
-    p5: f.p5,
+    ewma: f.ewma,
     profit: f.profit,
     marginPct: f.marginPct,
-    marginBelowMedianPct: f.marginBelowMedianPct ?? 0,
     demandScore: f.demandScore,
     volumeScore: f.volumeScore,
     confidenceScore: f.confidenceScore,
     sampleCount: f.sampleCount,
-    volume: f.volume ?? 0,
     signature: f.signature,
-    finder: f.finder ?? 0,
-    finderLabel: f.finderLabel ?? '',
     detectedAt: f.detectedAt,
   };
 }
 
 /**
  * Insert a stripped flip into the top-flips leaderboard (kept sorted desc,
- * capped at TOP_FLIPS_MAX entries). Deduplicates by UUID — if the same
- * auction appears again (e.g. after seenAuctions TTL expiry), only the
- * higher-profit entry is kept.
+ * capped at TOP_FLIPS_MAX entries).
  *
  * @param {Array} arr
  * @param {object} flip
  */
 function insertTopFlip(arr, flip) {
-  // Check if this UUID is already in the leaderboard
-  const existingIdx = arr.findIndex(f => f.uuid === flip.uuid);
-  if (existingIdx >= 0) {
-    // Only replace if the new profit is higher
-    if (flip.profit > arr[existingIdx].profit) {
-      arr[existingIdx] = flip;
-      arr.sort((a, b) => b.profit - a.profit);
-    }
-    return;
-  }
   arr.push(flip);
   arr.sort((a, b) => b.profit - a.profit);
   if (arr.length > TOP_FLIPS_MAX) arr.length = TOP_FLIPS_MAX;
@@ -445,9 +380,8 @@ async function sendFlips(flips, C) {
 
 // ── Embed builders ────────────────────────────────────────────
 /**
- * Build a rich per-flip embed showing cost, lowest BIN, median, profit,
- * margin, parsed item attributes, and demand/volume/confidence scores.
- * Matches the Coflnet flip display style.
+ * Build a rich per-flip embed showing buy/market/profit/margin, parsed
+ * item attributes, and demand/volume/confidence scores.
  *
  * @param {object} flip  Full flip record (must include `attrs`)
  * @returns {import('discord.js').EmbedBuilder}
@@ -456,25 +390,19 @@ function buildFlipEmbed(flip) {
   const attrs = flip.attrs;
   const color = attrs.rarityColor || C.flip;
   const title = attrs.name.length > 240 ? attrs.name.slice(0, 240) + '…' : attrs.name;
-  const finderBadge = flip.finderLabel ? `[${flip.finderLabel}] ` : '';
 
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`💰 ${finderBadge}${title}`)
+    .setTitle(`💰 ${title}`)
     .setDescription(`\`/viewauction ${flip.uuid}\``)
     .addFields(
-      { name: 'Cost',         value: `${formatCoins(flip.buyPrice)} coins`,     inline: true },
-      { name: 'Lowest BIN',   value: formatCoins(flip.lowestBin || 0),          inline: true },
-      { name: 'Median',       value: formatCoins(flip.median || 0),              inline: true },
+      { name: 'Buy Price',    value: `${formatCoins(flip.buyPrice)} coins`,     inline: true },
+      { name: 'Market EWMA',  value: `${formatCoins(flip.ewma)} coins`,         inline: true },
       { name: 'Profit',       value: `**+${formatCoins(flip.profit)}**`,        inline: true },
       { name: 'Margin',       value: `${flip.marginPct.toFixed(1)}%`,            inline: true },
-      { name: 'Volume',       value: `${flip.volume || 0}/day`,                  inline: true },
+      { name: 'Profit Floor', value: `${formatCoins(flip.profitFloor)} (p5)`,   inline: true },
+      { name: 'Demand',       value: `${flip.demandScore}/100`,                  inline: true },
     );
-
-  // Second lowest BIN (validation — shows there's a real market)
-  if (flip.secondLowestBin > 0) {
-    embed.addFields({ name: '2nd Lowest BIN', value: formatCoins(flip.secondLowestBin), inline: true });
-  }
 
   // ── Attributes section (only non-zero / non-null) ──
   const attrLines = [];
@@ -503,13 +431,13 @@ function buildFlipEmbed(flip) {
   }
 
   embed.addFields(
-    { name: 'Demand',     value: `${flip.demandScore}/100`,                  inline: true },
-    { name: 'Confidence', value: `${flip.confidenceScore}/100`,              inline: true },
-    { name: 'Samples',    value: `${flip.sampleCount}`,                       inline: true },
+    { name: 'Volume Score', value: `${flip.volumeScore}/100`,                  inline: true },
+    { name: 'Confidence',   value: `${flip.confidenceScore.toFixed(0)}/100`,   inline: true },
+    { name: 'Tier',         value: attrs.tier || '—',                          inline: true },
   );
 
   embed.setFooter({
-    text: `SkyBot v2 Sniper • ${flip.finderLabel || 'FLIP'} • ${flip.sampleCount} samples • Vol ${flip.volume || 0}/day`,
+    text: `SkyBot AH Flipper • EWMA: ${flip.sampleCount} samples • Confidence ${flip.confidenceScore.toFixed(0)}/100`,
   });
   embed.setTimestamp();
   return embed;
@@ -526,11 +454,10 @@ function buildBatchEmbed(flips) {
   const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
   const lines = flips.map((f, i) => {
     const medal = medals[i] || `${i + 1}.`;
-    const finderTag = f.finderLabel ? ` [${f.finderLabel}]` : '';
     return (
-      `${medal} **${f.itemName}**${finderTag}\n` +
-      `   Cost ${formatCoins(f.buyPrice)} • LBIN ${formatCoins(f.lowestBin || 0)} • Med ${formatCoins(f.median || 0)}\n` +
-      `   Profit **+${formatCoins(f.profit)}** (${f.marginPct.toFixed(1)}%) • Vol ${f.volume || 0}/day\n` +
+      `${medal} **${f.itemName}**\n` +
+      `   Buy ${formatCoins(f.buyPrice)} • EWMA ${formatCoins(f.ewma)} • ` +
+      `Profit +${formatCoins(f.profit)} (${f.marginPct.toFixed(1)}%)\n` +
       `   \`/viewauction ${f.uuid}\``
     );
   });
@@ -547,7 +474,7 @@ function buildBatchEmbed(flips) {
       { name: 'Best Margin',         value: `${bestMargin.toFixed(1)}%`,     inline: true },
       { name: 'Avg Confidence',      value: `${avgConf.toFixed(0)}/100`,     inline: true },
     )
-    .setFooter({ text: 'SkyBot v2 Sniper • Batch Mode' })
+    .setFooter({ text: 'SkyBot AH Flipper • Batch Mode' })
     .setTimestamp();
 }
 
@@ -853,48 +780,29 @@ export function getFlipWatcherStats() {
 
 /**
  * Get the most recent N detected flips (most-recent-first).
- * Deduplicated by UUID to prevent React key collisions in the dashboard.
  *
  * @param {number} [limit=20]  Maximum results to return (capped at 100)
  * @returns {Array}
  */
 export function getRecentFlips(limit = 20) {
   const n = Math.max(1, Math.min(100, Number(limit) || 20));
-  const seen = new Set();
-  const deduped = [];
-  for (const f of state.recentFlips) {
-    if (seen.has(f.uuid)) continue;
-    seen.add(f.uuid);
-    deduped.push(f);
-    if (deduped.length >= n) break;
-  }
-  return deduped;
+  return state.recentFlips.slice(0, n);
 }
 
 /**
  * Get the top N most-profitable flips ever detected (sorted desc by profit).
- * Deduplicated by UUID to prevent React key collisions in the dashboard.
  *
  * @param {number} [limit=10]  Maximum results to return (capped at 100)
  * @returns {Array}
  */
 export function getTopFlips(limit = 10) {
   const n = Math.max(1, Math.min(100, Number(limit) || 10));
-  const seen = new Set();
-  const deduped = [];
-  for (const f of state.topFlips) {
-    if (seen.has(f.uuid)) continue;
-    seen.add(f.uuid);
-    deduped.push(f);
-    if (deduped.length >= n) break;
-  }
-  return deduped;
+  return state.topFlips.slice(0, n);
 }
 
 /**
  * Search the recent-flips ring buffer by item name / tier / signature.
- * Case-insensitive substring match. Deduplicated by UUID.
- * Returns up to 50 results.
+ * Case-insensitive substring match. Returns up to 50 results.
  *
  * @param {string} query  Search string
  * @returns {Array}
@@ -902,19 +810,9 @@ export function getTopFlips(limit = 10) {
 export function searchFlips(query) {
   if (!query || typeof query !== 'string') return [];
   const q = query.toLowerCase();
-  const seen = new Set();
-  const deduped = [];
-  for (const f of state.recentFlips) {
-    if (seen.has(f.uuid)) continue;
-    if (
-      (f.itemName || '').toLowerCase().includes(q) ||
-      (f.tier || '').toLowerCase().includes(q) ||
-      (f.signature || '').toLowerCase().includes(q)
-    ) {
-      seen.add(f.uuid);
-      deduped.push(f);
-      if (deduped.length >= 50) break;
-    }
-  }
-  return deduped;
+  return state.recentFlips.filter(f =>
+    (f.itemName || '').toLowerCase().includes(q) ||
+    (f.tier || '').toLowerCase().includes(q) ||
+    (f.signature || '').toLowerCase().includes(q)
+  ).slice(0, 50);
 }

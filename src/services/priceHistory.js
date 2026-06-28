@@ -1,59 +1,69 @@
 /**
  * priceHistory.js — SkyBot v2 Sniper-Grade Price Database
  *
- * Rewritten to match the Coflnet/SkyCofl flip-finding approach:
- *   - Tracks lowestBin + secondLowestBin per signature (Sniper algorithm)
- *   - Tracks median (p50) from recent samples (Sniper Median algorithm)
- *   - Tracks volume (sales/day estimate)
+ * CRITICAL FIX: Separates HISTORICAL data from CURRENT scan data.
  *
- * A "signature" groups items by relevant modifiers:
- *   name|tier|isPet|petLevelBucket|stars|isRecombobulated|reforge|hpbBucket|keyEnchants
+ * - `currentPrices[]` — prices from the CURRENT scan (reset each scan)
+ * - `historicalPrices[]` — prices from PREVIOUS scans (accumulated, 30-min TTL)
+ *
+ * This prevents the #1 flip false-positive: when a cheap item is listed,
+ * it shouldn't drag down the median and make itself look like a flip.
+ *
+ * Market price for flip detection = HISTORICAL median (past scans only)
+ * Current lowest BIN = cheapest listing in the CURRENT scan
  *
  * Public API:
- *   updatePrice(signature, price)           — add a sample
- *   getMarketPrice(signature)               — returns {lowestBin, secondLowestBin, median, p5, min, max, count, volume, lastSeen}
- *   startScanEpoch()                        — marks the start of a scan (resets lowestBin/secondLowestBin for re-discovery)
- *   finalizeScanEpoch()                     — commits the scan results
+ *   startScanEpoch()                        — resets currentPrices for new scan
+ *   updatePrice(signature, price)           — add a sample (goes to currentPrices)
+ *   finalizeScanEpoch()                     — moves currentPrices → historicalPrices
+ *   getMarketPrice(signature)               — returns {lowestBin, secondLowestBin, median, p5, count, volume, ...}
  *   getStats()                              — aggregate stats
  *   exportSnapshot()                        — all records for dashboard
  *   prune(maxAgeMs)                         — remove stale records
  */
 
-/** Maximum length of the per-signature recent[] ring buffer. */
-const RECENT_MAX = 100;
+/** Max historical samples per signature. */
+const HISTORICAL_MAX = 100;
 
-/** How long to retain samples for median calc (15 min). */
-const SAMPLE_TTL_MS = 15 * 60 * 1000;
-
-/**
- * @typedef {Object} PriceRecord
- * @property {number} lowestBin          Current lowest BIN for this signature
- * @property {number} secondLowestBin    Second lowest BIN (validation)
- * @property {number} median             Median (p50) from recent samples
- * @property {number} p5                 5th percentile (conservative floor)
- * @property {number} min                All-time min
- * @property {number} max                All-time max
- * @property {number} count              Total samples ever seen
- * @property {number} volume             Estimated sales per day
- * @property {number} lastSeen           unix ms of last update
- * @property {number[]} recent           last RECENT_MAX {price, ts} samples
- * @property {number} ewma               EWMA (kept for backward compat, not used for flip detection)
- */
+/** How long to retain historical samples (30 min). */
+const HISTORICAL_TTL_MS = 30 * 60 * 1000;
 
 /** @type {Map<string, PriceRecord>} */
 const store = new Map();
 
-/** Whether we're in a scan epoch (lowestBin gets rebuilt each scan). */
+/** Whether we're collecting current-scan data. */
 let scanEpoch = false;
 
 /**
- * Update price history for a signature with a new observed price.
- * During a scan epoch, tracks the lowestBin and secondLowestBin.
- * Always updates median from recent samples.
- *
- * @param {string} signature  Normalized item signature
- * @param {number} price      Observed BIN price (coins)
- * @returns {PriceRecord|null} The updated record, or null on invalid input
+ * @typedef {Object} PriceRecord
+ * @property {number[]} currentPrices    Prices seen in the CURRENT scan
+ * @property {number[]} historicalPrices  Prices from PREVIOUS scans (for median)
+ * @property {number} lowestBin           Cheapest in current scan
+ * @property {number} secondLowestBin     2nd cheapest in current scan
+ * @property {number} median              Median of HISTORICAL prices
+ * @property {number} p5                  5th percentile of HISTORICAL prices
+ * @property {number} min                 All-time min
+ * @property {number} max                 All-time max
+ * @property {number} count               Total samples ever seen
+ * @property {number} volume              Estimated sales per day
+ * @property {number} lastSeen            unix ms
+ * @property {number} ewma                EWMA (kept for compat)
+ */
+
+/**
+ * Start a new scan epoch. Resets currentPrices for all records.
+ */
+export function startScanEpoch() {
+  scanEpoch = true;
+  for (const rec of store.values()) {
+    rec.currentPrices = [];
+    rec.lowestBin = Infinity;
+    rec.secondLowestBin = Infinity;
+  }
+}
+
+/**
+ * Add a price sample. During a scan epoch, goes to currentPrices.
  */
 export function updatePrice(signature, price) {
   if (!signature || typeof signature !== 'string') return null;
@@ -64,16 +74,17 @@ export function updatePrice(signature, price) {
 
   if (!rec) {
     rec = {
-      lowestBin: price,
+      currentPrices: [],
+      historicalPrices: [],
+      lowestBin: Infinity,
       secondLowestBin: Infinity,
-      median: price,
-      p5: price,
+      median: 0,
+      p5: 0,
       min: price,
       max: price,
       count: 0,
       volume: 0,
       lastSeen: now,
-      recent: [],
       ewma: price,
     };
     store.set(signature, rec);
@@ -82,13 +93,17 @@ export function updatePrice(signature, price) {
   rec.count += 1;
   rec.lastSeen = now;
 
-  // Update all-time min/max
   if (price < rec.min) rec.min = price;
   if (price > rec.max) rec.max = price;
 
-  // During a scan epoch, track lowestBin and secondLowestBin
-  // These are rebuilt each scan cycle to reflect CURRENT market state
+  // EWMA (kept for backward compat)
+  if (rec.count > 1) {
+    rec.ewma = (0.3 * price) + (0.7 * rec.ewma);
+  }
+
+  // During scan epoch, track current prices
   if (scanEpoch) {
+    rec.currentPrices.push(price);
     if (price < rec.lowestBin) {
       rec.secondLowestBin = rec.lowestBin;
       rec.lowestBin = price;
@@ -97,71 +112,60 @@ export function updatePrice(signature, price) {
     }
   }
 
-  // EWMA (kept for backward compat, not primary)
-  if (rec.count > 1) {
-    rec.ewma = (0.3 * price) + (0.7 * rec.ewma);
-  }
-
-  // Add to recent samples with timestamp
-  rec.recent.push({ price, ts: now });
-  // Prune old samples
-  const cutoff = now - SAMPLE_TTL_MS;
-  while (rec.recent.length > 0 && rec.recent[0].ts < cutoff) {
-    rec.recent.shift();
-  }
-  // Cap at RECENT_MAX
-  if (rec.recent.length > RECENT_MAX) {
-    rec.recent = rec.recent.slice(-RECENT_MAX);
-  }
-
-  // Recompute median and p5 from recent samples
-  if (rec.recent.length >= 2) {
-    const sorted = rec.recent.map(s => s.price).sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    rec.median = sorted.length % 2 === 0
-      ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
-      : sorted[mid];
-    const p5idx = Math.max(0, Math.floor(sorted.length * 0.05));
-    rec.p5 = sorted[p5idx];
-
-    // Estimate volume: samples in last 15 min, scaled to per-day
-    const recentCount = rec.recent.length;
-    const minutesSpan = SAMPLE_TTL_MS / 60000;
-    rec.volume = Math.round((recentCount / minutesSpan) * 60 * 24);
-  }
-
   return rec;
 }
 
 /**
- * Start a new scan epoch. Resets lowestBin/secondLowestBin for all
- * records so they get rebuilt during this scan cycle.
- * Call this at the beginning of each AH scan.
+ * Finalize the scan epoch. Moves currentPrices into historicalPrices
+ * and recomputes median/p5 from historical data.
+ *
+ * CRITICAL: This must be called AFTER all auctions in a scan are processed,
+ * BEFORE flip detection runs. This way:
+ *   - `lowestBin` / `secondLowestBin` reflect the CURRENT scan (what's buyable NOW)
+ *   - `median` / `p5` reflect PREVIOUS scans (historical market price)
  */
-export function startScanEpoch() {
-  scanEpoch = true;
+export function finalizeScanEpoch() {
+  scanEpoch = false;
+  const now = Date.now();
+  const cutoff = now - HISTORICAL_TTL_MS;
+
   for (const rec of store.values()) {
-    rec.lowestBin = Infinity;
-    rec.secondLowestBin = Infinity;
+    // Move current scan prices into historical
+    if (rec.currentPrices.length > 0) {
+      rec.historicalPrices.push(...rec.currentPrices);
+    }
+
+    // Prune old historical samples (keep last HISTORICAL_MAX)
+    if (rec.historicalPrices.length > HISTORICAL_MAX) {
+      rec.historicalPrices = rec.historicalPrices.slice(-HISTORICAL_MAX);
+    }
+
+    // Recompute median and p5 from HISTORICAL data only
+    if (rec.historicalPrices.length >= 2) {
+      const sorted = [...rec.historicalPrices].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      rec.median = sorted.length % 2 === 0
+        ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+        : sorted[mid];
+      const p5idx = Math.max(0, Math.floor(sorted.length * 0.05));
+      rec.p5 = sorted[p5idx];
+
+      // Volume estimate: historical samples / 30 min * 1440 min/day
+      rec.volume = Math.round((rec.historicalPrices.length / 30) * 1440);
+    }
   }
 }
 
 /**
- * Finalize the scan epoch. Records that had no samples during this
- * scan keep their previous lowestBin (Infinity means "not on AH now").
- */
-export function finalizeScanEpoch() {
-  scanEpoch = false;
-  // For records where lowestBin is still Infinity (not seen this scan),
-  // keep the old values by not touching them — they'll be pruned by TTL
-}
-
-/**
- * Retrieve the current market price snapshot for a signature.
- * Returns null if the signature has never been observed.
+ * Get market price snapshot for a signature.
+ *
+ * Returns:
+ *   - lowestBin / secondLowestBin: from CURRENT scan (what's buyable now)
+ *   - median / p5: from HISTORICAL data (past market price)
+ *   - count: total historical samples
  *
  * @param {string} signature
- * @returns {{lowestBin:number,secondLowestBin:number,median:number,p5:number,min:number,max:number,count:number,volume:number,lastSeen:number,ewma:number}|null}
+ * @returns {object|null}
  */
 export function getMarketPrice(signature) {
   const rec = store.get(signature);
@@ -173,7 +177,7 @@ export function getMarketPrice(signature) {
     p5: rec.p5,
     min: rec.min,
     max: rec.max,
-    count: rec.count,
+    count: rec.historicalPrices.length,
     volume: rec.volume,
     lastSeen: rec.lastSeen,
     ewma: rec.ewma,
@@ -181,9 +185,7 @@ export function getMarketPrice(signature) {
 }
 
 /**
- * Aggregate high-level stats for the dashboard.
- *
- * @returns {{signatures:number,totalSamples:number,oldestSignatureMs:number}}
+ * Aggregate stats for dashboard.
  */
 export function getStats() {
   let totalSamples = 0;
@@ -204,10 +206,7 @@ export function getStats() {
 }
 
 /**
- * Export a flat snapshot of every tracked signature (sorted by sample count desc).
- * Used by the dashboard to render a price-table view.
- *
- * @returns {Array<object>}
+ * Export all signatures for dashboard.
  */
 export function exportSnapshot() {
   const out = [];
@@ -220,7 +219,7 @@ export function exportSnapshot() {
       p5: r.p5,
       min: r.min,
       max: r.max,
-      count: r.count,
+      count: r.historicalPrices.length,
       volume: r.volume,
       lastSeen: r.lastSeen,
     });
@@ -230,11 +229,7 @@ export function exportSnapshot() {
 }
 
 /**
- * Remove all signatures whose lastSeen is older than maxAgeMs.
- * Returns the number of records removed.
- *
- * @param {number} maxAgeMs  Maximum age in milliseconds
- * @returns {number} Number of records pruned
+ * Remove stale records.
  */
 export function prune(maxAgeMs) {
   if (typeof maxAgeMs !== 'number' || maxAgeMs <= 0) return 0;
@@ -250,9 +245,7 @@ export function prune(maxAgeMs) {
   return removed;
 }
 
-/**
- * Internal helper: reset the entire store. Used only in tests.
- */
+/** Reset (tests only). */
 export function _reset() {
   store.clear();
   scanEpoch = false;
