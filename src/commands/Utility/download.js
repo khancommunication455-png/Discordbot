@@ -70,14 +70,16 @@ export default {
 
     await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('⬇️ Downloading...').setDescription(`**URL:** ${url.slice(0, 80)}\n**Quality:** ${quality === 'audio' ? 'MP3 Audio' : quality}\n\nThis may take 10-60 seconds depending on video length.`).setFooter(FOOTER).setTimestamp()] });
 
-    // Build format selector
+    // Build format selector with fallbacks
+    // The trailing /best ensures we always get SOMETHING even if specific
+    // formats aren't available for the chosen player client
     let formatArg;
     if (quality === 'audio') {
-      formatArg = `-x --audio-format mp3 --audio-quality 0`;
+      formatArg = `-x --audio-format mp3 --audio-quality 0 -f "bestaudio/best"`;
     } else if (quality === 'best') {
-      formatArg = `-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=webm]/best"`;
+      formatArg = `-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=webm]/bestvideo+bestaudio/best"`;
     } else {
-      formatArg = `-f "bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]"`;
+      formatArg = `-f "bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]/best"`;
     }
 
     // Try multiple player clients for YouTube bot bypass
@@ -101,14 +103,23 @@ export default {
 
     if (!downloadSuccess) {
       const errStr = String(lastError?.stderr || lastError?.message || lastError);
-      // Check if it's a YouTube bot block
-      const isBotBlock = errStr.includes('Sign in to confirm') || errStr.includes('not a bot');
+      // Check specific error types for better messages
+      let errorMsg;
+      if (errStr.includes('Sign in to confirm') || errStr.includes('not a bot')) {
+        errorMsg = 'YouTube is blocking the bot from downloading this video. This is a known issue with server IPs. Try a different video or use a direct link.';
+      } else if (errStr.includes('Instagram') && errStr.includes('empty media')) {
+        errorMsg = 'Instagram requires login to download this post. Instagram blocks downloads from server IPs without authentication. Only public Instagram posts can be downloaded.';
+      } else if (errStr.includes('Private video') || errStr.includes('unavailable')) {
+        errorMsg = 'This video is private or unavailable.';
+      } else if (errStr.includes('page needs to be reloaded')) {
+        errorMsg = 'YouTube is blocking the bot. Try again in a few minutes, or use a direct video URL.';
+      } else {
+        errorMsg = `Download failed: ${errStr.slice(0, 300)}`;
+      }
       return interaction.editReply({ embeds: [new EmbedBuilder()
         .setColor(C.error)
         .setTitle('❌ Download Failed')
-        .setDescription(isBotBlock
-          ? 'YouTube is blocking the bot from downloading this video. This is a known issue with server IPs. Try a different video or use a direct link.'
-          : `Download failed: ${errStr.slice(0, 300)}`)
+        .setDescription(errorMsg)
         .setFooter(FOOTER).setTimestamp()] });
     }
 
