@@ -149,13 +149,13 @@ export default {
         formatArg = `-f "bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]"`;
       }
 
-      // --no-cookie + --extractor-args bypasses YouTube's "Sign in to confirm
+      // --no-cookies + --extractor-args bypasses YouTube's "Sign in to confirm
       // you're not a bot" block on Railway/server IPs
-      const cmd = `"${ytdlp}" ${formatArg} --no-playlist --max-filesize 24M --no-warnings --no-cookie --extractor-args "youtube:player_client=web" -o "${outTpl}" "${url}"`;
+      const cmd = `"${ytdlp}" ${formatArg} --no-playlist --max-filesize 24M --no-warnings --no-cookies --extractor-args "youtube:player_client=web" -o "${outTpl}" "${url}"`;
 
       // Get title while downloading (best-effort, don't block on it).
       let title = 'video';
-      execAsync(`"${ytdlp}" --get-title --no-playlist --no-cookie --extractor-args "youtube:player_client=web" "${url}" 2>/dev/null`)
+      execAsync(`"${ytdlp}" --get-title --no-playlist --no-cookies --extractor-args "youtube:player_client=web" "${url}" 2>/dev/null`)
         .then((r) => { title = (r.stdout?.trim() || 'video').slice(0, 60); })
         .catch(() => { /* ignore */ });
 

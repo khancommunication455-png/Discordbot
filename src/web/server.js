@@ -28,28 +28,25 @@ export function startWebDashboard(client) {
   // ── CORS — allows the dashboard (Vercel) to call the bot (Railway) ──
   // In production, the dashboard runs on a different domain than the bot.
   // Without CORS, browsers block cross-origin requests.
-  const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
+  //
+  // We ALWAYS set Access-Control-Allow-Origin to the requesting origin
+  // (or * if no origin header). The bot's API doesn't expose sensitive
+  // data without DASHBOARD_TOKEN auth, so allowing all origins is safe.
   app.use((req, res, next) => {
     const origin = req.headers.origin;
+
     if (origin) {
-      if (ALLOWED_ORIGINS.length === 0) {
-        // No allowlist set — allow all origins (development mode)
-        res.setHeader('Access-Control-Allow-Origin', '*');
-      } else if (ALLOWED_ORIGINS.includes(origin)) {
-        // Origin is in the allowlist — allow it
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Vary', 'Origin');
-      } else {
-        // Origin not allowed — deny (CORS will block the browser from reading the response)
-        // But still let the request through (non-browser clients like curl ignore CORS)
-      }
+      // Echo the requesting origin back — allows any dashboard to connect
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    } else {
+      // No Origin header (curl, server-to-server) — allow all
+      res.setHeader('Access-Control-Allow-Origin', '*');
     }
+
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Max-Age', '86400'); // 24h preflight cache
 
     // Handle preflight OPTIONS requests
@@ -70,6 +67,121 @@ export function startWebDashboard(client) {
     }
     next();
   }
+
+  // ── Root status page (no auth) ──────────────────────────────
+  // Shows a simple HTML status page when someone visits the Railway URL
+  // in a browser. Without this, visiting / returns "Cannot GET /".
+  app.get('/', (req, res) => {
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const mins = Math.floor((uptime % 3600) / 60);
+    const secs = Math.floor(uptime % 60);
+    const uptimeStr = `${hours}h ${mins}m ${secs}s`;
+
+    res.setHeader('Content-Type', 'text/html');
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SkyBot v2 — API Status</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0a0e14; color: #e0e0e0; min-height: 100vh;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .card {
+      max-width: 560px; width: 100%; background: #111827;
+      border: 1px solid #1e293b; border-radius: 16px; padding: 40px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+    .logo {
+      width: 48px; height: 48px; border-radius: 12px;
+      background: linear-gradient(135deg, #00D4AA, #00796B);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 24px; font-weight: bold; color: white;
+    }
+    h1 { font-size: 1.4rem; font-weight: 700; }
+    .badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: 0.75rem; font-weight: 600; margin-left: 8px;
+      background: rgba(0,212,170,0.15); color: #00D4AA; border: 1px solid rgba(0,212,170,0.3);
+    }
+    .status {
+      display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+      background: #064e3b; border-radius: 8px; margin-bottom: 20px;
+      font-weight: 600; color: #34d399;
+    }
+    .dot {
+      width: 10px; height: 10px; border-radius: 50%; background: #34d399;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+    .stat {
+      background: #1e293b; border-radius: 8px; padding: 12px 16px;
+    }
+    .stat-label { font-size: 0.7rem; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px; }
+    .stat-value { font-size: 1.1rem; font-weight: 700; margin-top: 4px; }
+    .endpoints { margin-top: 20px; }
+    .endpoints h2 { font-size: 0.9rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
+    .endpoint {
+      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+      background: #0f172a; border-radius: 6px; margin-bottom: 6px;
+      font-family: 'SF Mono', Monaco, monospace; font-size: 0.85rem;
+    }
+    .method { color: #00D4AA; font-weight: 700; min-width: 40px; }
+    .path { color: #93c5fd; }
+    .desc { color: #64748b; font-size: 0.75rem; margin-left: auto; }
+    a { color: #00D4AA; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer { margin-top: 24px; font-size: 0.75rem; color: #475569; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="logo">🤖</div>
+      <div>
+        <h1>SkyBot v2 <span class="badge">Railway Edition</span></h1>
+        <div style="font-size:0.8rem;color:#64748b;">Hypixel Skyblock Discord Bot</div>
+      </div>
+    </div>
+    <div class="status">
+      <span class="dot"></span>
+      Bot is online and running
+    </div>
+    <div class="grid">
+      <div class="stat">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value">${uptimeStr}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">API Port</div>
+        <div class="stat-value">${process.env.PORT || 8080}</div>
+      </div>
+    </div>
+    <div class="endpoints">
+      <h2>API Endpoints</h2>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/health</span><span class="desc">Health check (JSON)</span></div>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/api/stats</span><span class="desc">Bot overview stats</span></div>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/api/flips/recent</span><span class="desc">Recent flips</span></div>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/api/flips/top</span><span class="desc">Top all-time flips</span></div>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/api/config</span><span class="desc">Bot configuration</span></div>
+      <div class="endpoint"><span class="method">GET</span><span class="path">/api/tts/sessions</span><span class="desc">Active TTS sessions</span></div>
+    </div>
+    <div class="footer">
+      This is the bot's REST API server. The control dashboard is a separate<br>
+      deployment (Vercel) that calls these endpoints.<br><br>
+      Set <code>NEXT_PUBLIC_BOT_API_URL</code> on Vercel to this URL.
+    </div>
+  </div>
+</body>
+</html>`);
+  });
 
   // ── Health check (no auth) ──────────────────────────────────
   app.get('/health', (req, res) => {

@@ -1,0 +1,26 @@
+{
+  "name": "skybot-railway",
+  "version": "2.0.0",
+  "description": "SkyBot v2 — Railway-ready Hypixel Skyblock Discord Bot with flawless TTS/Voice and powerful AH Flip Tracker",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "deploy": "node src/deploy-commands.js",
+    "register": "node src/deploy-commands.js"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.18.0",
+    "axios": "^1.7.7",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "groq-sdk": "^0.7.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

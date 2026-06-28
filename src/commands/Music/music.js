@@ -117,7 +117,7 @@ async function getVideoInfo(query) {
 
   const json = await spawnCapture(
     YTDLP,
-    ['-J', '--no-playlist', '--no-warnings', '--no-progress', '--no-cookie',
+    ['-J', '--no-playlist', '--no-warnings', '--no-progress', '--no-cookies',
      '--extractor-args', 'youtube:player_client=web', target],
     25_000,
   );
@@ -155,7 +155,7 @@ async function getAudioUrl(videoUrl) {
       '--no-playlist',
       '--no-warnings',
       '--no-progress',
-      '--no-cookie',
+      '--no-cookies',
       '--extractor-args', 'youtube:player_client=web',
       videoUrl,
     ],
