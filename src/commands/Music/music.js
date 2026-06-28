@@ -101,7 +101,16 @@ async function getVideoInfo(query) {
 async function getAudioUrl(videoUrl) {
   for (const client of PLAYER_CLIENTS) {
     try {
-      const out = await spawnCapture(YTDLP, ['-f', 'bestaudio', '-g', ...BASE_ARGS, '--extractor-args', `youtube:player_client=${client}`, videoUrl], 20_000);
+      // Use flexible format: bestaudio, fall back to best (which includes audio)
+      // --format-sort ensures yt-dlp picks the best available audio-bearing format
+      const out = await spawnCapture(YTDLP, [
+        '-f', 'bestaudio/best',
+        '--format-sort', 'has_audio,abr',
+        '-g',
+        ...BASE_ARGS,
+        '--extractor-args', `youtube:player_client=${client}`,
+        videoUrl,
+      ], 20_000);
       const url = out.split('\n').map(s => s.trim()).filter(Boolean)[0];
       if (url) { console.log(`[Music] audio URL via ${client} ✅`); return url; }
     } catch (err) {
@@ -211,7 +220,14 @@ export default {
 
       let track;
       try { track = await getVideoInfo(query); }
-      catch (err) { return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Search Failed').setDescription(err.message).setFooter(FOOTER).setTimestamp()] }); }
+      catch (err) {
+        const msg = String(err.message || err);
+        let desc = msg;
+        if (msg.includes('page needs to be reloaded') || msg.includes('not a bot')) {
+          desc = 'YouTube is temporarily blocking the bot. Try again in a few minutes, or use a direct video URL.';
+        }
+        return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Search Failed').setDescription(desc).setFooter(FOOTER).setTimestamp()] });
+      }
 
       state.queue.push(track);
       if (!state.connection || state.connection.state.status === 'Destroyed') {
@@ -281,3 +297,4 @@ export default {
     }
   },
 };
+                   
