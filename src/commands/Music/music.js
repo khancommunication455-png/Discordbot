@@ -123,12 +123,22 @@ async function getAudioUrl(videoUrl) {
   return null;
 }
 
-// ── Create audio stream (ffmpeg → raw PCM) ──
+// ── Create audio stream (ffmpeg → OggOpus) ────────────────────
+// CRITICAL: Use libopus encoding in ffmpeg, then StreamType.OggOpus
+// in @discordjs/voice. This bypasses the need for @discordjs/opus
+// native bindings — ffmpeg does all the opus encoding server-side.
 function createAudioStream(audioUrl) {
   const ff = spawn(FFMPEG, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-i', audioUrl, '-vn',
-    '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+    '-c:a', 'libopus',           // encode to opus using ffmpeg's built-in libopus
+    '-b:a', '96k',               // 96kbps (Discord voice quality)
+    '-ar', '48000',              // 48kHz (Discord requirement)
+    '-ac', '2',                  // stereo
+    '-application', 'voip',      // optimize for voice/music
+    '-frame_duration', '20',     // 20ms frames (Discord standard)
+    '-f', 'ogg',                 // Ogg container
+    'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   ff.stderr.on('data', () => {});
   return ff;
@@ -176,7 +186,7 @@ async function playNext(client, guildId, textChannel) {
   }
 
   const ff = createAudioStream(audioUrl);
-  const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: false });
+  const resource = createAudioResource(ff.stdout, { inputType: StreamType.OggOpus, inlineVolume: false });
 
   if (!state.player) {
     state.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });

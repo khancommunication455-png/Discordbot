@@ -332,11 +332,15 @@ function createTranscoder() {
 /**
  * Play an MP3 buffer in the guild's voice channel.
  *
- * Pipeline: MP3 buffer → ffmpeg stdin → ffmpeg decodes to raw PCM 48k stereo
- *           → ffmpeg stdout → createAudioResource(StreamType.Raw) →
- *           @discordjs/voice encodes to opus via @discordjs/opus → Discord
+ * CRITICAL FIX: Uses ffmpeg to encode to OggOpus (not raw PCM).
+ * This means @discordjs/voice uses StreamType.OggOpus (passthrough mode)
+ * and does NOT need @discordjs/opus or any native opus encoder.
  *
- * Resolves when the player returns to Idle, rejects on error.
+ * Pipeline: MP3 buffer → ffmpeg (libopus encoder) → OggOpus stream →
+ *           @discordjs/voice (passthrough, no encoding needed) → Discord
+ *
+ * This is the same approach Eris uses (format: "ogg") and is the ONLY
+ * reliable way to get audio working on Railway without native opus bindings.
  *
  * @param {Object} state
  * @param {Buffer} mp3Buffer
@@ -353,17 +357,24 @@ function playMP3(state, mp3Buffer) {
 
     console.log(`[TTS] playMP3: MP3 buffer is ${mp3Buffer.length} bytes`);
 
-    // Spawn ffmpeg directly — more reliable than prism-media on Railway
+    // Spawn ffmpeg to decode MP3 AND encode to opus in one step.
+    // ffmpeg's libopus encoder is built into the ffmpeg-headless nix package.
+    // Output format: OggOpus (ogg container with opus audio)
+    // @discordjs/voice reads this with StreamType.OggOpus — NO native encoder needed!
     let ffmpegProc;
     try {
       ffmpegProc = spawn(FFMPEG, [
-        '-i',            'pipe:0',
+        '-i',              'pipe:0',        // read MP3 from stdin
         '-analyzeduration', '0',
-        '-loglevel',     'error',
-        '-f',            's16le',
-        '-ar',           '48000',
-        '-ac',           '2',
-        'pipe:1',
+        '-loglevel',       'error',
+        '-c:a',            'libopus',       // encode to opus using ffmpeg's built-in libopus
+        '-b:a',            '96k',           // 96kbps bitrate (Discord voice quality)
+        '-ar',             '48000',         // 48kHz (Discord requirement)
+        '-ac',             '2',             // stereo
+        '-application',    'voip',          // optimize for voice
+        '-frame_duration', '20',            // 20ms frames (Discord standard)
+        '-f',              'ogg',           // Ogg container
+        'pipe:1',                           // write to stdout
       ], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
       console.error('[TTS] Failed to spawn ffmpeg:', e.message);
@@ -371,13 +382,13 @@ function playMP3(state, mp3Buffer) {
       return;
     }
 
-    let pcmBytes = 0;
+    let oggBytes = 0;
     let stderrBuf = '';
 
     ffmpegProc.stdout.on('data', (chunk) => {
-      pcmBytes += chunk.length;
-      if (pcmBytes === chunk.length) {
-        console.log('[TTS] First PCM chunk received from ffmpeg ✅');
+      oggBytes += chunk.length;
+      if (oggBytes === chunk.length) {
+        console.log('[TTS] First OggOpus chunk received from ffmpeg ✅');
       }
     });
 
@@ -397,7 +408,7 @@ function playMP3(state, mp3Buffer) {
         finish(new Error(`ffmpeg exited ${code}`));
         return;
       }
-      console.log(`[TTS] ffmpeg finished: produced ${pcmBytes} bytes of PCM`);
+      console.log(`[TTS] ffmpeg finished: produced ${oggBytes} bytes of OggOpus`);
     });
 
     // Write MP3 buffer to ffmpeg's stdin
@@ -411,9 +422,12 @@ function playMP3(state, mp3Buffer) {
       return;
     }
 
-    // Create audio resource from ffmpeg's PCM stdout
+    // Create audio resource with StreamType.OggOpus (PASSTHROUGH — no encoding!)
+    // This is the key: @discordjs/voice reads pre-encoded opus packets from
+    // the ogg container and sends them directly to Discord. No @discordjs/opus
+    // or opusscript needed!
     const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType:     StreamType.Raw,
+      inputType:     StreamType.OggOpus,
       inlineVolume:  false,
     });
 
@@ -444,7 +458,7 @@ function playMP3(state, mp3Buffer) {
 
     try {
       state.player.play(resource);
-      console.log('[TTS] player.play() called — waiting for audio to play...');
+      console.log('[TTS] player.play() called (OggOpus passthrough — no native encoder needed)');
     } catch (e) {
       console.error('[TTS] player.play() threw:', e.message);
       finish(e);
@@ -454,7 +468,7 @@ function playMP3(state, mp3Buffer) {
     setTimeout(() => {
       if (!settled) {
         console.error('[TTS] TIMEOUT: No playback after 15s');
-        console.error(`[TTS]   PCM produced: ${pcmBytes} bytes`);
+        console.error(`[TTS]   OggOpus produced: ${oggBytes} bytes`);
         console.error(`[TTS]   ffmpeg alive: ${ffmpegProc.killed ? 'NO' : 'yes'}`);
         console.error('[TTS]   Player status:', state.player.state?.status);
         if (stderrBuf) console.error('[TTS]   ffmpeg stderr:', stderrBuf.slice(0, 300));
@@ -479,14 +493,18 @@ function startKeepAlive(state) {
         '-f',          'lavfi',
         '-i',          'anullsrc=r=48000:cl=stereo',
         '-t',          '0.2',
-        '-f',          's16le',
+        '-c:a',        'libopus',
+        '-b:a',        '96k',
         '-ar',         '48000',
         '-ac',         '2',
+        '-application', 'voip',
+        '-frame_duration', '20',
+        '-f',          'ogg',
         'pipe:1',
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      proc.stderr.on('data', () => {});  // suppress
+      proc.stderr.on('data', () => {});
       const resource = createAudioResource(proc.stdout, {
-        inputType:    StreamType.Raw,
+        inputType:    StreamType.OggOpus,
         inlineVolume: false,
       });
       state.player.play(resource);
@@ -816,23 +834,23 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
   startKeepAlive(state);
 
   // ── Play silence warmup to prime the audio pipeline ──
-  // This prevents the "autopaused" issue where the player pauses because
-  // the voice connection isn't fully subscribed when the first TTS plays.
-  // 1 second of silence establishes the audio stream and UDP connection.
+  // Uses OggOpus format (same as actual TTS playback) so the pipeline
+  // is primed with the exact same stream type.
   try {
     console.log('[TTS] Playing silence warmup to prime audio pipeline...');
     const warmupProc = spawn(FFMPEG, [
       '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
       '-t', '1',
-      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+      '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+      '-application', 'voip', '-frame_duration', '20',
+      '-f', 'ogg', 'pipe:1',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     warmupProc.stderr.on('data', () => {});
     const warmupResource = createAudioResource(warmupProc.stdout, {
-      inputType: StreamType.Raw,
+      inputType: StreamType.OggOpus,
       inlineVolume: false,
     });
     state.player.play(warmupResource);
-    // Wait for warmup to finish (1s audio + buffer)
     await sleep(1500);
     console.log('[TTS] Silence warmup complete ✅ — audio pipeline primed');
   } catch (err) {
