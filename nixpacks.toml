@@ -12,7 +12,7 @@
 # ─────────────────────────────────────────────────────────────
 
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python3", "gcc", "make"]
+nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python3", "gcc", "gnumake"]
 
 [variables]
 NODE_ENV = "production"
