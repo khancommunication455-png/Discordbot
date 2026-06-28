@@ -34,7 +34,7 @@ import { getAllAuctions, parseItemAttributes } from './hypixel.js';
 import * as priceHistory from './priceHistory.js';
 import { getDb, saveDb } from '../utils/db.js';
 import { C, formatCoins } from '../utils/embeds.js';
-import { EmbedBuilder } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { getConfig, getAllConfig, getConfigSource, shouldPostFlipsToDiscord, isFlipWatcherEnabled } from '../utils/runtimeConfig.js';
 
 // ── Configuration (read at runtime via runtimeConfig.js) ─────
@@ -157,7 +157,8 @@ async function runScan() {
 
   // ── Phase 1: Build price database (ALL BINs in this scan) ──
   // startScanEpoch resets currentPrices so they get rebuilt fresh.
-  // Historical prices (from PREVIOUS scans) are preserved.
+  // Historical prices (from PREVIOUS scans) are preserved and NOT modified
+  // during this phase.
   priceHistory.startScanEpoch();
 
   const allBins = [];
@@ -171,9 +172,15 @@ async function runScan() {
     allBins.push({ auction: a, attrs, sig });
   }
 
-  // finalizeScanEpoch moves currentPrices → historicalPrices
-  // AFTER this, market.median reflects PREVIOUS scans only (not current)
-  priceHistory.finalizeScanEpoch();
+  // NOTE: Do NOT call finalizeScanEpoch() yet!
+  // We need to detect flips using HISTORICAL data (previous scans) only.
+  // If we finalize now, the current scan's prices would contaminate the
+  // historical median, making cheap items look like flips of themselves.
+  //
+  // Flip detection uses:
+  //   - market.median (from historicalPrices = PREVIOUS scans)
+  //   - market.lowestBin (from currentPrices = THIS scan)
+  //   - cost = a.starting_bid (THIS scan's price)
 
   // ── Phase 2: Detect flips using HISTORICAL median vs current cost ──
   const flipsThisCycle = [];
@@ -246,6 +253,12 @@ async function runScan() {
 
   // Sort by profit descending
   flipsThisCycle.sort((a, b) => b.profit - a.profit);
+
+  // ── Phase 3: Finalize scan epoch ──
+  // NOW move currentPrices → historicalPrices for the NEXT scan.
+  // This must happen AFTER flip detection so the current scan's prices
+  // don't contaminate the historical median used for THIS scan's flips.
+  priceHistory.finalizeScanEpoch();
 
   // ── Update statistics ──
   state.scansRun++;
@@ -364,14 +377,45 @@ async function sendFlips(flips, C) {
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
   try {
     if (top.length === 1) {
-      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])] });
+      // Single flip: embed + "Copy AH ID" button for mobile users
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`copy_ah_${top[0].uuid}`)
+          .setLabel('📋 Copy /viewauction')
+          .setStyle(ButtonStyle.Primary)
+      );
+      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])], components: [row] });
     } else if (top.length === 2) {
+      const row = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId(`copy_ah_${top[0].uuid}`)
+            .setLabel('📋 Copy #1')
+            .setStyle(ButtonStyle.Primary)
+        )
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId(`copy_ah_${top[1].uuid}`)
+            .setLabel('📋 Copy #2')
+            .setStyle(ButtonStyle.Secondary)
+        );
       await channel.send({
         content: ping,
         embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])],
+        components: [row],
       });
     } else {
-      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)] });
+      // Batch: embed + buttons for each flip
+      const row = new ActionRowBuilder();
+      top.slice(0, 5).forEach((f, i) => {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`copy_ah_${f.uuid}`)
+            .setLabel(`📋 ${i + 1}`)
+            .setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        );
+      });
+      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)], components: [row] });
     }
   } catch (err) {
     console.warn('[AHFlip] Channel send failed:', err.message);
@@ -815,4 +859,21 @@ export function searchFlips(query) {
     (f.tier || '').toLowerCase().includes(q) ||
     (f.signature || '').toLowerCase().includes(q)
   ).slice(0, 50);
+}
+
+// ── Button handler for "Copy AH ID" buttons ──────────────────
+// Called by interactionCreate.js when a button with customId starting
+// with "copy_ah_" is clicked. Replies with the /viewauction command
+// in an ephemeral message that the user can easily copy on mobile.
+export async function handleButton(interaction, client) {
+  if (!interaction.customId?.startsWith('copy_ah_')) return false;
+  const uuid = interaction.customId.slice(8);
+  if (!uuid) return false;
+
+  // Reply with the command in a code block (easy to copy on all platforms)
+  await interaction.reply({
+    content: `📋 **Copy this command and paste it in Hypixel chat:**\n\`\`\`\n/viewauction ${uuid}\n\`\`\``,
+    ephemeral: true,
+  });
+  return true;
 }

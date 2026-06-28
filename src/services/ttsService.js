@@ -331,8 +331,13 @@ function createTranscoder() {
 
 /**
  * Play an MP3 buffer in the guild's voice channel.
- * Pipes MP3 → prism FFmpeg → 48k PCM → @discordjs/voice audio resource.
+ *
+ * Pipeline: MP3 buffer → ffmpeg stdin → ffmpeg decodes to raw PCM 48k stereo
+ *           → ffmpeg stdout → createAudioResource(StreamType.Raw) →
+ *           @discordjs/voice encodes to opus via @discordjs/opus → Discord
+ *
  * Resolves when the player returns to Idle, rejects on error.
+ *
  * @param {Object} state
  * @param {Buffer} mp3Buffer
  * @returns {Promise<void>}
@@ -346,47 +351,116 @@ function playMP3(state, mp3Buffer) {
       err ? reject(err) : resolve();
     };
 
-    let transcoder;
+    console.log(`[TTS] playMP3: MP3 buffer is ${mp3Buffer.length} bytes`);
+
+    // Spawn ffmpeg directly — more reliable than prism-media on Railway
+    let ffmpegProc;
     try {
-      transcoder = createTranscoder();
+      ffmpegProc = spawn(FFMPEG, [
+        '-i',            'pipe:0',
+        '-analyzeduration', '0',
+        '-loglevel',     'error',
+        '-f',            's16le',
+        '-ar',           '48000',
+        '-ac',           '2',
+        'pipe:1',
+      ], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
-      console.error('[TTS] FFmpeg transcoder spawn failed:', e.message);
+      console.error('[TTS] Failed to spawn ffmpeg:', e.message);
       finish(e);
       return;
     }
 
-    // prism-media's FFmpeg is a Duplex: write MP3 to it, read PCM from it.
-    transcoder.on('error', (err) => {
-      console.error('[TTS] Transcoder error:', err.message);
+    let pcmBytes = 0;
+    let stderrBuf = '';
+
+    ffmpegProc.stdout.on('data', (chunk) => {
+      pcmBytes += chunk.length;
+      if (pcmBytes === chunk.length) {
+        console.log('[TTS] First PCM chunk received from ffmpeg ✅');
+      }
+    });
+
+    ffmpegProc.stderr.on('data', (chunk) => {
+      stderrBuf += chunk.toString();
+    });
+
+    ffmpegProc.on('error', (err) => {
+      console.error('[TTS] ffmpeg process error:', err.message);
       finish(err);
     });
 
-    // Feed the MP3 buffer into the transcoder's stdin.
+    ffmpegProc.on('close', (code) => {
+      if (code !== 0 && code !== null) {
+        console.error(`[TTS] ffmpeg exited with code ${code}`);
+        if (stderrBuf) console.error('[TTS] ffmpeg stderr:', stderrBuf.slice(0, 500));
+        finish(new Error(`ffmpeg exited ${code}`));
+        return;
+      }
+      console.log(`[TTS] ffmpeg finished: produced ${pcmBytes} bytes of PCM`);
+    });
+
+    // Write MP3 buffer to ffmpeg's stdin
     try {
-      transcoder.write(mp3Buffer);
-      transcoder.end();
+      ffmpegProc.stdin.write(mp3Buffer);
+      ffmpegProc.stdin.end();
+      console.log('[TTS] MP3 buffer written to ffmpeg stdin ✅');
     } catch (e) {
-      console.error('[TTS] Failed to feed transcoder:', e.message);
+      console.error('[TTS] Failed to write to ffmpeg stdin:', e.message);
       finish(e);
       return;
     }
 
-    // Build the audio resource — Raw PCM, NO inlineVolume (Railway-safe).
-    const resource = createAudioResource(transcoder, {
-      inputType:      StreamType.Raw,
-      inlineVolume:   false,  // CRITICAL: avoids opusscript native binding
+    // Create audio resource from ffmpeg's PCM stdout
+    const resource = createAudioResource(ffmpegProc.stdout, {
+      inputType:     StreamType.Raw,
+      inlineVolume:  false,
     });
 
-    state.player.once(AudioPlayerStatus.Idle, () => finish());
-    state.player.once('error', (err) => finish(err));
+    // Track player status transitions
+    const statusHandler = (oldState, newState) => {
+      console.log(`[TTS] Player: ${oldState.status} → ${newState.status}`);
+      if (newState.status === AudioPlayerStatus.Playing) {
+        console.log('[TTS] Player is now PLAYING ✅ (audio should be audible in VC)');
+      }
+      if (newState.status === AudioPlayerStatus.Idle && oldState.status === AudioPlayerStatus.Playing) {
+        console.log('[TTS] Player finished playback');
+        state.player.off(AudioPlayerStatus.Transitioning, statusHandler);
+        finish();
+      }
+    };
+    state.player.on(AudioPlayerStatus.Transitioning, statusHandler);
+
+    state.player.once(AudioPlayerStatus.Idle, () => {
+      console.log('[TTS] Player reached Idle');
+      finish();
+    });
+
+    state.player.once('error', (err) => {
+      console.error('[TTS] Player error:', err.message);
+      state.player.off(AudioPlayerStatus.Transitioning, statusHandler);
+      finish(err);
+    });
 
     try {
       state.player.play(resource);
-      console.log('[TTS] player.play() called (Raw PCM 48k stereo via prism-media FFmpeg)');
+      console.log('[TTS] player.play() called — waiting for audio to play...');
     } catch (e) {
       console.error('[TTS] player.play() threw:', e.message);
       finish(e);
     }
+
+    // Safety timeout
+    setTimeout(() => {
+      if (!settled) {
+        console.error('[TTS] TIMEOUT: No playback after 15s');
+        console.error(`[TTS]   PCM produced: ${pcmBytes} bytes`);
+        console.error(`[TTS]   ffmpeg alive: ${ffmpegProc.killed ? 'NO' : 'yes'}`);
+        console.error('[TTS]   Player status:', state.player.state?.status);
+        if (stderrBuf) console.error('[TTS]   ffmpeg stderr:', stderrBuf.slice(0, 300));
+        finish(new Error('TTS playback timeout'));
+      }
+    }, 15_000);
   });
 }
 

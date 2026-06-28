@@ -1,16 +1,5 @@
 /**
- * interactionCreate.js — slash command dispatcher with cooldowns
- *
- * Handles 4 interaction types:
- *   1. Autocomplete → command.autocomplete(interaction, client)
- *   2. ChatInputCommand → command.execute(interaction, client) (with cooldowns)
- *   3. Button click → first command whose handleButton() returns true wins
- *   4. String select menu → first command whose handleSelectMenu() returns true wins
- *
- * Buttons/selects are dispatched by iterating all loaded commands and calling
- * their optional handleButton/handleSelectMenu hooks (must return truthy if
- * the interaction was claimed). This lets commands own their component
- * interactions without a centralized handler.
+ * interactionCreate.js — slash command + button dispatcher
  */
 import { Collection } from 'discord.js';
 
@@ -31,31 +20,36 @@ export default {
       return;
     }
 
-    // ── Button clicks (e.g. carry panel buttons, partyfinder Join Party) ──
+    // ── Button handler ──
     if (interaction.isButton()) {
+      // Check services first (ahFlipWatcher copy_ah_ buttons)
+      try {
+        const { handleButton: flipButton } = await import('../services/ahFlipWatcher.js');
+        if (await flipButton(interaction, client)) return;
+      } catch {}
+
+      // Check commands with handleButton methods
       for (const command of client.commands.values()) {
-        if (typeof command.handleButton !== 'function') continue;
-        try {
-          const claimed = await command.handleButton(interaction, client);
-          if (claimed) return;
-        } catch (err) {
-          console.error(`[Button] /${command.data?.name ?? '?'} error:`, err);
-          // Don't return — let other handlers try
+        if (typeof command.handleButton === 'function') {
+          try {
+            if (await command.handleButton(interaction, client)) return;
+          } catch (err) {
+            console.error('[Button] Error:', err.message);
+          }
         }
       }
-      // Fall through: unhandled button — silently ignore (or could log)
       return;
     }
 
-    // ── String select menus (e.g. /carry register) ──
+    // ── Select menu handler ──
     if (interaction.isStringSelectMenu()) {
       for (const command of client.commands.values()) {
-        if (typeof command.handleSelectMenu !== 'function') continue;
-        try {
-          const claimed = await command.handleSelectMenu(interaction, client);
-          if (claimed) return;
-        } catch (err) {
-          console.error(`[SelectMenu] /${command.data?.name ?? '?'} error:`, err);
+        if (typeof command.handleSelectMenu === 'function') {
+          try {
+            if (await command.handleSelectMenu(interaction, client)) return;
+          } catch (err) {
+            console.error('[SelectMenu] Error:', err.message);
+          }
         }
       }
       return;
@@ -81,7 +75,7 @@ export default {
       if (now < expiry) {
         const left = Math.ceil((expiry - now) / 1000);
         return interaction.reply({
-          content: `⏱️ Please wait **${left}s** before using \`${command.data.name}\` again.`,
+          content: `⏱️ Please wait **${left}s** before using \`/${command.data.name}\` again.`,
           ephemeral: true,
         }).catch(() => {});
       }
