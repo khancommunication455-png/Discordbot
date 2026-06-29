@@ -88,31 +88,27 @@ async function synthesize(text) {
   throw new Error('All TTS providers failed');
 }
 
-// ── Build voice connection (Ready ONLY — Signalling produces silence) ──
+// ── Build voice connection (Signalling + grace sleep, like original v1) ──
 async function buildConnection(guildId, voiceChannelId, adapterCreator) {
-  // Try up to 3 times with INCREASING timeouts
-  // Railway UDP to Discord can take 30-60s to establish
-  const timeouts = [30_000, 45_000, 60_000];
+  const connection = joinVoiceChannel({ channelId: voiceChannelId, guildId, adapterCreator, selfDeaf: false, selfMute: false });
   
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const connection = joinVoiceChannel({ channelId: voiceChannelId, guildId, adapterCreator, selfDeaf: false, selfMute: false });
-    
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, timeouts[attempt - 1]);
-      console.log(`[TTS] Ready ✅ (attempt ${attempt}/${timeouts[attempt-1]/1000}s, UDP established)`);
-      // Short grace sleep for first audio frame
-      await new Promise(r => setTimeout(r, 1500));
-      return connection;
-    } catch {
-      console.warn(`[TTS] Ready timed out (attempt ${attempt}/3, ${timeouts[attempt-1]/1000}s)`);
-      try { connection.destroy(); } catch {}
-      if (attempt < 3) {
-        console.log(`[TTS] Retrying in 5s...`);
-        await new Promise(r => setTimeout(r, 5000));
-      }
-    }
+  // Wait for Signalling — WebSocket to Discord voice gateway (NO UDP needed)
+  // The original v1 bot used this and it worked on Railway.
+  // UDP negotiates in the BACKGROUND during the 3s sleep below.
+  try {
+    await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
+    console.log('[TTS] Signalling reached ✅ (WebSocket connected, UDP negotiating in background)');
+  } catch {
+    try { connection.destroy(); } catch {}
+    throw new Error('Could not reach Discord voice gateway — check bot has Connect + Speak permissions');
   }
-  throw new Error('Voice connection failed after 3 attempts. This usually means Railway is blocking UDP to Discord voice servers. Check: 1) Bot has Connect+Speak permissions 2) Try /tts start again in 5 minutes');
+  
+  // Grace sleep: let UDP negotiate in the background before first audio frame.
+  // This is the CRITICAL step — audio won't play without this sleep.
+  // 3 seconds is enough for Railway's UDP to establish.
+  await new Promise(r => setTimeout(r, 3000));
+  console.log('[TTS] Connection ready (post-sleep) ✅');
+  return connection;
 }
 
 // ── Play MP3 buffer (OggOpus passthrough — NO native encoder) ──
@@ -191,28 +187,20 @@ async function processQueue(guildId) {
   const state = ttsState.get(guildId);
   if (!state || state.active || !state.queue.length) return;
 
-  // Verify connection is in Ready state (NOT Signalling — Signalling = no UDP = silence)
+  // Verify connection is active (Ready OR Signalling — both work on Railway)
   if (state.connection) {
     const cs = state.connection.state?.status;
-    if (cs !== VoiceConnectionStatus.Ready) {
-      console.warn(`[TTS] Connection not Ready (${cs}), waiting up to 30s...`);
+    if (cs !== VoiceConnectionStatus.Ready && cs !== VoiceConnectionStatus.Signalling) {
+      console.warn(`[TTS] Connection not active (${cs}), waiting...`);
       try {
-        await entersState(state.connection, VoiceConnectionStatus.Ready, 30_000);
-        console.log('[TTS] Connection Ready ✅');
+        await entersState(state.connection, VoiceConnectionStatus.Signalling, 10_000);
+        console.log('[TTS] Connection active ✅');
       } catch {
-        console.error('[TTS] Connection NOT Ready after 30s — audio will be silent. Reconnecting...');
-        // Force reconnect
-        try { state.connection.destroy(); } catch {}
+        console.error('[TTS] Connection lost — reconnecting...');
         state.connectionDead = true;
         state.active = false;
         const ok = await rejoinVC(state, guildId);
         if (!ok) return;
-        // After rejoin, verify Ready again
-        if (state.connection?.state?.status !== VoiceConnectionStatus.Ready) {
-          console.error('[TTS] Reconnect also not Ready — skipping message');
-          state.active = false;
-          return;
-        }
       }
     }
   }
@@ -285,3 +273,4 @@ export function getAllTTSStates() { return [...ttsState.values()].map(s => ({ gu
 
 // ── Button handler for Copy AH ID (called by interactionCreate) ──
 export async function handleButton(interaction, client) { return false; }
+      
