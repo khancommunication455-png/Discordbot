@@ -12,21 +12,10 @@
  */
 import axios from 'axios';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const BROWSER_HEADERS = {
-  'User-Agent': UA,
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'identity',
-  'Cache-Control': 'no-cache',
-  'Pragma': 'no-cache',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-site',
-};
-const TIMEOUT = 15_000;
+const UA = 'SkyBot-v2/2.0 (Discord; +https://github.com/skybot)';
+const TIMEOUT = 12_000;
 
-const HYPIXEL    = axios.create({ baseURL: 'https://api.hypixel.net/',          timeout: TIMEOUT, headers: BROWSER_HEADERS });
+const HYPIXEL    = axios.create({ baseURL: 'https://api.hypixel.net/',          timeout: TIMEOUT, headers: { 'User-Agent': UA } });
 const MOJANG     = axios.create({ baseURL: 'https://api.mojang.com/',           timeout: TIMEOUT, headers: { 'User-Agent': UA } });
 const ASHCON     = axios.create({ baseURL: 'https://api.ashcon.app/mojang/v2/', timeout: TIMEOUT, headers: { 'User-Agent': UA } });
 const SLOTHPIXEL = axios.create({ baseURL: 'https://api.slothpixel.me/api/',    timeout: 15_000,  headers: { 'User-Agent': UA } });
@@ -142,9 +131,8 @@ export async function getAHPage(page = 0) {
 
 // ── Get all AH pages in parallel (rate-limit aware) ───────────
 // Hypixel returns totalPages on page 0. We fetch up to maxPages in
-// concurrent batches of 2 with 500ms delay between batches to stay
-// under Hypixel's rate limit (~1 req/s for public, more with key).
-export async function getAllAuctions(maxPages = 10) {
+// concurrent batches of 3 to stay under rate limits.
+export async function getAllAuctions(maxPages = 3) {
   const firstPage = await getAHPage(0);
   const totalPages = Math.min(firstPage.totalPages ?? 0, maxPages);
   if (totalPages <= 1) return firstPage.auctions ?? [];
@@ -153,8 +141,8 @@ export async function getAllAuctions(maxPages = 10) {
   const batches = [];
   for (let p = 1; p < totalPages; p++) batches.push(p);
 
-  // Process in chunks of 2 concurrently with 500ms delay between chunks
-  const chunkSize = 2;
+  // Process in chunks of 3 concurrently
+  const chunkSize = 3;
   for (let i = 0; i < batches.length; i += chunkSize) {
     const chunk = batches.slice(i, i + chunkSize);
     const results = await Promise.allSettled(chunk.map(p => getAHPage(p)));
@@ -162,10 +150,6 @@ export async function getAllAuctions(maxPages = 10) {
       if (r.status === 'fulfilled' && r.value?.auctions) {
         allAuctions.push(...r.value.auctions);
       }
-    }
-    // 500ms delay between batches to avoid rate limiting
-    if (i + chunkSize < batches.length) {
-      await new Promise(r => setTimeout(r, 500));
     }
   }
   return allAuctions;

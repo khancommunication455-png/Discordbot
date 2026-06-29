@@ -19,29 +19,6 @@ export function startWebDashboard(client) {
   const app = express();
   app.use(express.json());
 
-  // ── CORS — allows Vercel dashboard to call Railway bot ──
-  app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-    } else {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-    }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Max-Age', '86400');
-    if (req.method === 'OPTIONS') return res.status(204).end();
-    next();
-  });
-
-  // ── Root status page ──
-  app.get('/', (req, res) => {
-    res.setHeader('Content-Type', 'text/html');
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SkyBot v2</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0a0e14;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{max-width:500px;width:100%;background:#111827;border:1px solid #1e293b;border-radius:16px;padding:40px;box-shadow:0 8px 32px rgba(0,0,0,.4)}.logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00D4AA,#00796B);display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:20px}h1{font-size:1.4rem;margin-bottom:8px}.status{display:flex;align-items:center;gap:8px;padding:12px 16px;background:#064e3b;border-radius:8px;margin-bottom:20px;color:#34d399;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#34d399;animation:p 2s infinite}@keyframes p{0%,100%{opacity:1}50%{opacity:.5}}.stat{background:#1e293b;border-radius:8px;padding:12px;margin-bottom:8px}.label{font-size:.7rem;text-transform:uppercase;color:#64748b}.val{font-size:1.1rem;font-weight:700;margin-top:4px}a{color:#00D4AA}</style></head><body><div class="card"><div class="logo">🤖</div><h1>SkyBot v2 <span style="font-size:.7rem;color:#00D4AA">Railway Edition</span></h1><div class="status"><span class="dot"></span> Bot is online</div><div class="stat"><div class="label">Uptime</div><div class="val">${Math.floor(process.uptime()/3600)}h ${Math.floor(process.uptime()%3600/60)}m</div></div><div class="stat"><div class="label">Health Check</div><div class="val"><a href="/health">/health</a> | <a href="/api/stats">/api/stats</a></div></div></div></body></html>`);
-  });
-
   // Simple token auth (optional)
   const TOKEN = process.env.DASHBOARD_TOKEN;
   function auth(req, res, next) {

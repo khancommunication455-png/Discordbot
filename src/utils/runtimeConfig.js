@@ -14,13 +14,13 @@ import { getDb, saveDb } from './db.js';
 
 // ── Default values (used when neither DB nor env has a value) ──
 export const DEFAULTS = {
-  AH_FLIP_MIN_PROFIT:    500_000,    // 500K min profit
-  AH_FLIP_MIN_MARGIN:    10,         // 10% below historical median
-  AH_FLIP_MAX_PAGES:     10,         // Scan all 10 pages
+  AH_FLIP_MIN_PROFIT:    500_000,
+  AH_FLIP_MIN_MARGIN:    10,
+  AH_FLIP_MAX_PAGES:     10,
   AH_FLIP_INTERVAL:      30,
   AH_FLIP_MAX_PER_CYCLE: 5,
   AH_FLIP_MIN_DEMAND:    0,
-  AH_FLIP_MIN_SAMPLES:   5,          // Need 5+ historical samples for reliable median
+  AH_FLIP_MIN_SAMPLES:   5,
   AH_FLIP_CHANNEL_ID:    null,
   PREMIUM_ROLE_ID:       null,
   AH_FLIP_ENABLED:       null,

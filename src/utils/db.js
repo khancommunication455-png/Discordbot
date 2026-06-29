@@ -21,30 +21,6 @@ const defaultData = {
   premiumUsers:    [],          // [discordId, ...]
   // ── Carry system ──
   carryProviders:  {},
-  // carryConfig: per-guild admin-configured carry system
-  // {
-  //   [guildId]: {
-  //     categories: {
-  //       'dungeons':  { channelId: '...', emoji: '🏰', label: 'Dungeon Carry Service', enabled: true,
-  //                     items: [{ id:'f4', label:'Floor 4', emoji:'🏰', tier:'4', price:'4M' }, ...] },
-  //       'master':    { channelId: '...', emoji: '⭐', label: 'Master Mode Carry', enabled: true, items: [...] },
-  //       'slayers':   { channelId: '...', emoji: '👹', label: 'Slayer Carry Service', enabled: true, items: [...] },
-  //       'kuudra':    { channelId: '...', emoji: '🐉', label: 'Kuudra Carry Service', enabled: true, items: [...] },
-  //       'crimson':   { channelId: '...', emoji: '🔥', label: 'Crimson Carry Service', enabled: true, items: [...] },
-  //     },
-  //     panelMessageIds: { 'dungeons': 'msgId', ... },  // posted panel message IDs (for editing)
-  //     requestChannelId: '...',  // where request tickets get posted (optional)
-  //   }
-  // }
-  carryConfig:     {},
-  carryTickets:    {},          // { [threadId]: { itemId, requesterId, providerId, createdAt, channelId, guildId } }
-  // ── Welcome / Goodbye / Auto-Role (per-guild) ──
-  // welcomeConfig: { [guildId]: { channel, message, ping, image, enabled } }
-  // goodbyeConfig: { [guildId]: { channel, message, enabled } }
-  // autoRole:      { [guildId]: [roleId, ...] }
-  welcomeConfig:   {},
-  goodbyeConfig:   {},
-  autoRole:        {},
   // ── Discord chat leveling (per-guild) ──
   // { [guildId]: { users: { [userId]: { xp, level, totalXp } }, config: null } }
   leveling:        {},
@@ -86,33 +62,9 @@ const defaultData = {
   },
   // ── Guild config ──
   guildConfig:     {},
-  // ── Economy (per-guild, per-user) ──
-  // { [guildId]: { [userId]: { wallet, bank, lastDaily, lastWork, lastCrime, lastRob, inventory, totalEarned } } }
-  economy:         {},
-  // ── Giveaways (per-guild, per-message) ──
-  // { [guildId]: { [msgId]: { prize, endsAt, winners, channelId, ended, participants, hostId, endedWinners } } }
-  giveaways:       {},
-  // ── Birthdays (per-guild, per-user) ──
-  // { [guildId]: { [userId]: { day, month } } }
-  birthdays:       {},
   // ── Misc ──
   ticketCount:     0,
   warnings:        {},
-  // ── User notes (private moderator notes, per-guild per-user) ──
-  // { [guildId]: { [userId]: [{ note, mod, ts }] } }
-  userNotes:       {},
-  // ── Reaction roles (per-guild per-message per-emoji → roleId) ──
-  // { [guildId]: { [msgId]: { [emojiStr]: roleId } } }
-  reactionRoles:   {},
-  // ── Per-guild logging config (mod log channel + flags) ──
-  // { [guildId]: { channel: id, enabled: bool } }
-  loggingConfig:   {},
-  // ── Per-guild birthday announcement channel ──
-  // { [guildId]: channelId }
-  birthdayChannel: {},
-  // ── Per-guild music settings (volume + loop preference) ──
-  // { [guildId]: { volume: 0-100, loop: bool } }
-  musicSettings:   {},
 };
 
 let cache = null;

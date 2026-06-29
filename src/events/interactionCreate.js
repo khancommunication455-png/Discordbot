@@ -1,5 +1,5 @@
 /**
- * interactionCreate.js — slash command + button dispatcher
+ * interactionCreate.js — slash command dispatcher with cooldowns
  */
 import { Collection } from 'discord.js';
 
@@ -16,41 +16,6 @@ export default {
         await command.autocomplete(interaction, client);
       } catch (err) {
         console.error(`[Autocomplete] /${interaction.commandName} error:`, err);
-      }
-      return;
-    }
-
-    // ── Button handler ──
-    if (interaction.isButton()) {
-      // Check services first (ahFlipWatcher copy_ah_ buttons)
-      try {
-        const { handleButton: flipButton } = await import('../services/ahFlipWatcher.js');
-        if (await flipButton(interaction, client)) return;
-      } catch {}
-
-      // Check commands with handleButton methods
-      for (const command of client.commands.values()) {
-        if (typeof command.handleButton === 'function') {
-          try {
-            if (await command.handleButton(interaction, client)) return;
-          } catch (err) {
-            console.error('[Button] Error:', err.message);
-          }
-        }
-      }
-      return;
-    }
-
-    // ── Select menu handler ──
-    if (interaction.isStringSelectMenu()) {
-      for (const command of client.commands.values()) {
-        if (typeof command.handleSelectMenu === 'function') {
-          try {
-            if (await command.handleSelectMenu(interaction, client)) return;
-          } catch (err) {
-            console.error('[SelectMenu] Error:', err.message);
-          }
-        }
       }
       return;
     }

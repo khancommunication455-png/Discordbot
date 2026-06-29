@@ -46,7 +46,6 @@ import { dirname, join } from 'path';
 import { initDb } from './utils/db.js';
 import { startAHFlipWatcher } from './services/ahFlipWatcher.js';
 import { startAuctionSoldWatcher } from './services/auctionSoldWatcher.js';
-import { startAHChatBot } from './services/ahChatBot.js';
 import { startWebDashboard } from './web/server.js';
 import { autoDeployCommands } from './utils/autoDeploy.js';
 
@@ -78,14 +77,12 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessageReactions,
   ],
-  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 client.commands    = new Collection();
 client.cooldowns   = new Collection();
-client.musicQueues = new Map();  // per-guild music player state (see /music)
 
 // ── Load commands ────────────────────────────────────────────
 async function loadCommands(dir) {
@@ -117,23 +114,12 @@ async function loadEvents(dir) {
     const fullPath = join(dir, file);
     try {
       const mod = await import(pathToFileURL(fullPath).href);
-
-      // default export
       if (mod.default?.name) {
         const ev = mod.default;
         ev.once
           ? client.once(ev.name, (...a) => ev.execute(...a, client))
           : client.on(ev.name,   (...a) => ev.execute(...a, client));
         console.log(`  📡 Event: ${ev.name}`);
-      }
-
-      // named exports (e.g. reactionAdd, reactionRemove in reactionRoles.js)
-      for (const [key, ev] of Object.entries(mod)) {
-        if (key === 'default' || !ev?.name) continue;
-        ev.once
-          ? client.once(ev.name, (...a) => ev.execute(...a, client))
-          : client.on(ev.name,   (...a) => ev.execute(...a, client));
-        console.log(`  📡 Event: ${ev.name} (${key})`);
       }
     } catch (err) {
       console.error(`  ❌ Failed to load event ${file}:`, err.message);
@@ -212,7 +198,6 @@ async function main() {
     // ── Background services ──
     try { startAHFlipWatcher(client); } catch (err) { console.error('[AHFlip] Failed to start:', err.message); }
     try { startAuctionSoldWatcher(client); } catch (err) { console.error('[AuctionSold] Failed to start:', err.message); }
-    try { startAHChatBot(client); } catch (err) { console.error('[AHChatBot] Failed to start:', err.message); }
     try { startWebDashboard(client); } catch (err) { console.error('[Web] Failed to start:', err.message); }
     console.log('📡 Background services started');
 

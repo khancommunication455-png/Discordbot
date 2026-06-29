@@ -34,7 +34,7 @@ import { getAllAuctions, parseItemAttributes } from './hypixel.js';
 import * as priceHistory from './priceHistory.js';
 import { getDb, saveDb } from '../utils/db.js';
 import { C, formatCoins } from '../utils/embeds.js';
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { EmbedBuilder } from 'discord.js';
 import { getConfig, getAllConfig, getConfigSource, shouldPostFlipsToDiscord, isFlipWatcherEnabled } from '../utils/runtimeConfig.js';
 
 // ── Configuration (read at runtime via runtimeConfig.js) ─────
@@ -155,97 +155,64 @@ async function runScan() {
     return;
   }
 
-  // ── Phase 1: Build price database (ALL BINs in this scan) ──
-  // startScanEpoch resets currentPrices so they get rebuilt fresh.
-  // Historical prices (from PREVIOUS scans) are preserved and NOT modified
-  // during this phase.
-  priceHistory.startScanEpoch();
-
-  const allBins = [];
-  for (const a of auctions) {
-    if (!a.bin) continue;
-    let attrs;
-    try { attrs = parseItemAttributes(a); } catch { continue; }
-    if (!attrs.name) continue;
-    const sig = buildSignature(attrs);
-    priceHistory.updatePrice(sig, a.starting_bid);
-    allBins.push({ auction: a, attrs, sig });
-  }
-
-  // NOTE: Do NOT call finalizeScanEpoch() yet!
-  // We need to detect flips using HISTORICAL data (previous scans) only.
-  // If we finalize now, the current scan's prices would contaminate the
-  // historical median, making cheap items look like flips of themselves.
-  //
-  // Flip detection uses:
-  //   - market.median (from historicalPrices = PREVIOUS scans)
-  //   - market.lowestBin (from currentPrices = THIS scan)
-  //   - cost = a.starting_bid (THIS scan's price)
-
-  // ── Phase 2: Detect flips using HISTORICAL median vs current cost ──
   const flipsThisCycle = [];
   let binsScanned = 0;
-  const MIN_HISTORICAL_SAMPLES = 5; // Need at least 5 past samples for reliable median
 
-  for (const { auction: a, attrs, sig } of allBins) {
+  for (const a of auctions) {
+    // Skip non-BIN — auction-style bidding has unpredictable clearing prices
+    if (!a.bin) continue;
+    // Dedup already-seen auctions (Hypixel pages overlap between scans)
     if (state.seenAuctions.has(a.uuid)) continue;
     state.seenAuctions.set(a.uuid, Date.now());
     binsScanned++;
 
+    let attrs;
+    try {
+      attrs = parseItemAttributes(a);
+    } catch (err) {
+      console.warn(`[AHFlip] parseItemAttributes failed for ${a.uuid}:`, err.message);
+      continue;
+    }
+    if (!attrs.name) continue;
+
+    const sig = buildSignature(attrs);
+    // Always update price history — builds the market baseline
+    priceHistory.updatePrice(sig, a.starting_bid);
+
     const market = priceHistory.getMarketPrice(sig);
-    if (!market) continue;
+    if (!market || market.count < C.minSamples) continue;
 
-    // Need enough HISTORICAL samples for a reliable median
-    if (market.count < MIN_HISTORICAL_SAMPLES) continue;
+    const ewma       = market.ewma;
+    const marginPct  = (1 - a.starting_bid / ewma) * 100;
+    const profit     = ewma - a.starting_bid;
+    const profitFloor = Math.max(0, market.p5 - a.starting_bid);
 
-    const cost = a.starting_bid;
-    const median = market.median;
-
-    // Skip if no valid historical median
-    if (median <= 0) continue;
-
-    // ── Sniper Median: flip if cost is 5%+ below historical median ──
-    // This means: the item is priced below what it TYPICALLY sells for
-    const marginBelowMedianPct = ((median - cost) / median) * 100;
-    if (marginBelowMedianPct < C.minMarginPct) continue;
-
-    // Profit = median - cost (what you could sell it for minus what you pay)
-    const profit = median - cost;
+    // Flip thresholds (from runtime config)
+    if (marginPct < C.minMarginPct) continue;
     if (profit < C.minProfit) continue;
     if (attrs.demandScore < C.minDemand) continue;
 
-    // Don't flag items where cost >= median (no actual profit opportunity)
-    if (cost >= median) continue;
-
-    const marginPct = (profit / cost) * 100;
-    const volumeScore = Math.min(100, market.count * 3);
+    const volumeScore = Math.min(100, market.count);
     const confidenceScore = Math.min(
       100,
-      Math.round(0.4 * volumeScore + 0.3 * attrs.demandScore + 0.3 * Math.min(100, marginPct * 2))
+      0.4 * volumeScore + 0.3 * attrs.demandScore + 0.3 * Math.min(100, marginPct * 2)
     );
 
     flipsThisCycle.push({
       uuid: a.uuid,
       itemName: attrs.name,
       tier: attrs.tier,
-      buyPrice: cost,
-      lowestBin: market.lowestBin,
-      secondLowestBin: market.secondLowestBin,
-      median,
-      ewma: market.ewma,
+      buyPrice: a.starting_bid,
+      ewma,
       p5: market.p5,
       profit,
-      profitFloor: Math.max(0, market.p5 - cost),
+      profitFloor,
       marginPct,
-      marginBelowMedianPct,
       demandScore: attrs.demandScore,
       volumeScore,
       confidenceScore,
       sampleCount: market.count,
-      volume: market.volume,
       signature: sig,
-      finder: 4,
-      finderLabel: 'MSNIPE',
       attrs,
       detectedAt: Date.now(),
     });
@@ -253,12 +220,6 @@ async function runScan() {
 
   // Sort by profit descending
   flipsThisCycle.sort((a, b) => b.profit - a.profit);
-
-  // ── Phase 3: Finalize scan epoch ──
-  // NOW move currentPrices → historicalPrices for the NEXT scan.
-  // This must happen AFTER flip detection so the current scan's prices
-  // don't contaminate the historical median used for THIS scan's flips.
-  priceHistory.finalizeScanEpoch();
 
   // ── Update statistics ──
   state.scansRun++;
@@ -377,45 +338,14 @@ async function sendFlips(flips, C) {
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
   try {
     if (top.length === 1) {
-      // Single flip: embed + "Copy AH ID" button for mobile users
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`copy_ah_${top[0].uuid}`)
-          .setLabel('📋 Copy /viewauction')
-          .setStyle(ButtonStyle.Primary)
-      );
-      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])], components: [row] });
+      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])] });
     } else if (top.length === 2) {
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId(`copy_ah_${top[0].uuid}`)
-            .setLabel('📋 Copy #1')
-            .setStyle(ButtonStyle.Primary)
-        )
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId(`copy_ah_${top[1].uuid}`)
-            .setLabel('📋 Copy #2')
-            .setStyle(ButtonStyle.Secondary)
-        );
       await channel.send({
         content: ping,
         embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])],
-        components: [row],
       });
     } else {
-      // Batch: embed + buttons for each flip
-      const row = new ActionRowBuilder();
-      top.slice(0, 5).forEach((f, i) => {
-        row.addComponents(
-          new ButtonBuilder()
-            .setCustomId(`copy_ah_${f.uuid}`)
-            .setLabel(`📋 ${i + 1}`)
-            .setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary)
-        );
-      });
-      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)], components: [row] });
+      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)] });
     }
   } catch (err) {
     console.warn('[AHFlip] Channel send failed:', err.message);
@@ -859,21 +789,4 @@ export function searchFlips(query) {
     (f.tier || '').toLowerCase().includes(q) ||
     (f.signature || '').toLowerCase().includes(q)
   ).slice(0, 50);
-}
-
-// ── Button handler for "Copy AH ID" buttons ──────────────────
-// Called by interactionCreate.js when a button with customId starting
-// with "copy_ah_" is clicked. Replies with the /viewauction command
-// in an ephemeral message that the user can easily copy on mobile.
-export async function handleButton(interaction, client) {
-  if (!interaction.customId?.startsWith('copy_ah_')) return false;
-  const uuid = interaction.customId.slice(8);
-  if (!uuid) return false;
-
-  // Reply with the command in a code block (easy to copy on all platforms)
-  await interaction.reply({
-    content: `📋 **Copy this command and paste it in Hypixel chat:**\n\`\`\`\n/viewauction ${uuid}\n\`\`\``,
-    ephemeral: true,
-  });
-  return true;
 }
