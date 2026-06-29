@@ -127,30 +127,29 @@ function playMP3(state, mp3Buffer) {
 
     console.log(`[TTS] playMP3: ${mp3Buffer.length} bytes`);
 
-    // ffmpeg decodes MP3 AND encodes to OggOpus in one step
+    // Spawn ffmpeg to decode MP3 → raw PCM 48k stereo
+    // @discordjs/voice encodes PCM → opus using @discordjs/opus
     const ffmpegProc = spawn(FFMPEG, [
       '-i', 'pipe:0', '-analyzeduration', '0', '-loglevel', 'error',
-      '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2',
-      '-application', 'voip', '-frame_duration', '20', '-f', 'ogg', 'pipe:1',
+      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
-    let oggBytes = 0, stderrBuf = '';
-    ffmpegProc.stdout.on('data', (chunk) => { oggBytes += chunk.length; if (oggBytes === chunk.length) console.log('[TTS] First OggOpus chunk ✅'); });
+    let pcmBytes = 0, stderrBuf = '';
+    ffmpegProc.stdout.on('data', (chunk) => { pcmBytes += chunk.length; if (pcmBytes === chunk.length) console.log('[TTS] First PCM chunk ✅'); });
     ffmpegProc.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
     ffmpegProc.on('error', (err) => { console.error('[TTS] ffmpeg error:', err.message); finish(err); });
     ffmpegProc.on('close', (code) => {
       if (code !== 0 && code !== null) { console.error(`[TTS] ffmpeg exited ${code}: ${stderrBuf.slice(0, 300)}`); finish(new Error(`ffmpeg ${code}`)); return; }
-      console.log(`[TTS] ffmpeg done: ${oggBytes} bytes OggOpus`);
+      console.log(`[TTS] ffmpeg done: ${pcmBytes} bytes PCM`);
     });
 
-    try { ffmpegProc.stdin.write(mp3Buffer); ffmpegProc.stdin.end(); console.log('[TTS] MP3 written to ffmpeg ✅'); }
-    catch (e) { console.error('[TTS] stdin write failed:', e.message); finish(e); return; }
+    try { ffmpegProc.stdin.write(mp3Buffer); ffmpegProc.stdin.end(); console.log('[TTS] MP3 written ✅'); }
+    catch (e) { console.error('[TTS] stdin failed:', e.message); finish(e); return; }
 
-    // StreamType.OggOpus = PASSTHROUGH — no @discordjs/opus needed!
-    const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus, inlineVolume: false });
+    // StreamType.Raw = raw PCM, @discordjs/opus encodes to opus
+    const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw, inlineVolume: false });
 
     // Track player state changes using the CORRECT event: 'stateChange'
-    // NOT AudioPlayerStatus.Transitioning (that's a state value, not an event)
     let hasPlayed = false;
     const stateChangeHandler = (oldState, newState) => {
       console.log(`[TTS] Player: ${oldState.status} → ${newState.status}`);
@@ -158,7 +157,6 @@ function playMP3(state, mp3Buffer) {
         hasPlayed = true;
         console.log('[TTS] PLAYING ✅ (audio audible in VC)');
       }
-      // Only finish when player goes from Playing → Idle (playback complete)
       if (newState.status === AudioPlayerStatus.Idle && hasPlayed) {
         console.log('[TTS] Playback complete');
         state.player.off('stateChange', stateChangeHandler);
@@ -175,20 +173,18 @@ function playMP3(state, mp3Buffer) {
 
     try {
       state.player.play(resource);
-      console.log('[TTS] player.play() (OggOpus passthrough)');
+      console.log('[TTS] player.play() (Raw PCM → @discordjs/opus)');
     } catch (e) {
       console.error('[TTS] play() threw:', e.message);
       finish(e);
     }
 
-    // Safety timeout — if player never reaches Playing after 15s, something is wrong
     setTimeout(() => {
       if (!settled) {
-        console.error('[TTS] TIMEOUT: No playback after 15s');
-        console.error(`[TTS]   OggOpus: ${oggBytes}B, hasPlayed: ${hasPlayed}, status: ${state.player.state?.status}`);
-        if (stderrBuf) console.error('[TTS]   ffmpeg stderr:', stderrBuf.slice(0, 300));
+        console.error(`[TTS] TIMEOUT: pcm=${pcmBytes}B, hasPlayed=${hasPlayed}, status=${state.player.state?.status}`);
+        if (stderrBuf) console.error('[TTS] ffmpeg stderr:', stderrBuf.slice(0, 300));
         state.player.off('stateChange', stateChangeHandler);
-        finish(new Error('TTS playback timeout'));
+        finish(new Error('TTS timeout'));
       }
     }, 15_000);
   });

@@ -34,7 +34,7 @@ import { getAllAuctions, parseItemAttributes } from './hypixel.js';
 import * as priceHistory from './priceHistory.js';
 import { getDb, saveDb } from '../utils/db.js';
 import { C, formatCoins } from '../utils/embeds.js';
-import { EmbedBuilder } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { getConfig, getAllConfig, getConfigSource, shouldPostFlipsToDiscord, isFlipWatcherEnabled } from '../utils/runtimeConfig.js';
 
 // ── Configuration (read at runtime via runtimeConfig.js) ─────
@@ -338,18 +338,37 @@ async function sendFlips(flips, C) {
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
   try {
     if (top.length === 1) {
-      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])] });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`copy_ah_${top[0].uuid}`).setLabel('📋 Copy /viewauction').setStyle(ButtonStyle.Primary)
+      );
+      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])], components: [row] });
     } else if (top.length === 2) {
-      await channel.send({
-        content: ping,
-        embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])],
-      });
+      const row = new ActionRowBuilder()
+        .addComponents(new ButtonBuilder().setCustomId(`copy_ah_${top[0].uuid}`).setLabel('📋 Copy #1').setStyle(ButtonStyle.Primary))
+        .addComponents(new ButtonBuilder().setCustomId(`copy_ah_${top[1].uuid}`).setLabel('📋 Copy #2').setStyle(ButtonStyle.Secondary));
+      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])], components: [row] });
     } else {
-      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)] });
+      const row = new ActionRowBuilder();
+      top.slice(0, 5).forEach((f, i) => {
+        row.addComponents(new ButtonBuilder().setCustomId(`copy_ah_${f.uuid}`).setLabel(`📋 ${i + 1}`).setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary));
+      });
+      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)], components: [row] });
     }
   } catch (err) {
     console.warn('[AHFlip] Channel send failed:', err.message);
   }
+}
+
+// ── Button handler for Copy AH ID ──
+export async function handleButton(interaction, client) {
+  if (!interaction.customId?.startsWith('copy_ah_')) return false;
+  const uuid = interaction.customId.slice(8);
+  if (!uuid) return false;
+  await interaction.reply({
+    content: `📋 **Copy this command and paste it in Hypixel chat:**\n\`\`\`\n/viewauction ${uuid}\n\`\`\``,
+    ephemeral: true,
+  });
+  return true;
 }
 
 // ── Embed builders ────────────────────────────────────────────

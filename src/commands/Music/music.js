@@ -62,8 +62,12 @@ async function getAudioUrl(videoUrl) {
 }
 
 function createAudioStream(audioUrl) {
-  // OggOpus encoding via ffmpeg libopus — no native encoder needed
-  const ff = spawn(FFMPEG, ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', audioUrl, '-vn', '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2', '-application', 'voip', '-frame_duration', '20', '-f', 'ogg', 'pipe:1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Raw PCM output — @discordjs/opus encodes to opus
+  const ff = spawn(FFMPEG, [
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-i', audioUrl, '-vn',
+    '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
   ff.stderr.on('data', () => {});
   return ff;
 }
@@ -96,7 +100,7 @@ async function playNext(client, guildId, textChannel) {
   if (!audioUrl) { try { textChannel.send({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Playback Error').setDescription('Could not get audio URL. YouTube may be blocking.').setFooter(FOOTER).setTimestamp()] }); } catch {} state.queue.splice(state.current, 1); return playNext(client, guildId, textChannel); }
 
   const ff = createAudioStream(audioUrl);
-  const resource = createAudioResource(ff.stdout, { inputType: StreamType.OggOpus, inlineVolume: false });
+  const resource = createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: false });
 
   if (!state.player) {
     state.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
