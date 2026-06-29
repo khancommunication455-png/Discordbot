@@ -1,7 +1,7 @@
 {
   "name": "skybot-railway",
   "version": "2.0.0",
-  "description": "SkyBot v2 — Railway-ready Hypixel Skyblock Discord Bot with flawless TTS/Voice and powerful AH Flip Tracker",
+  "description": "SkyBot v2 — Railway-ready Hypixel Skyblock Discord Bot",
   "main": "src/index.js",
   "type": "module",
   "scripts": {

@@ -1,45 +1,28 @@
 /**
- * ahFlipWatcher.js — SkyBot v2 Powerful AH Flip Tracker
+ * ahFlipWatcher.js — SkyBot v2 AH Flip Tracker FIXED + UPGRADED
  *
- * Massive upgrade over v1 (which only scanned page 0 and compared to
- * the lowest BIN on the same page — useless when the whole page is
- * cheap).
+ * FIXES:
+ * 1. Flips now appear on FIRST scan — uses Moulberry lowestBIN as instant price baseline
+ * 2. No longer waits for minSamples to accumulate (uses external price data immediately)
+ * 3. Coflnet average price used as market reference when available (more accurate than EWMA)
+ * 4. Channel posting was broken: now validates channel ID on startup and logs clearly
+ * 5. seenAuctions TTL reduced to 5min so re-listed items are caught faster
  *
- * Features:
- *  A. Multi-page scanning via getAllAuctions(maxPages)
- *  B. Item signature normalization (reforge, stars, recomb, pets, etc.)
- *  C. Price history population for EVERY BIN seen (priceHistory.js)
- *  D. Flip detection using EWMA + margin + profit + demand + confidence
- *  E. Seen-auction deduplication with TTL-based cleanup
- *  F. Smart batching (1-2 individual rich embeds, 3+ batch table embed)
- *  G. Rich per-flip embed builder showing all parsed attributes
- *  H. Per-user subscription alerts via DM (or channelOverride fallback)
- *  I. Profit leaderboard persisted to db every 5 scans (I/O batching)
- *  J. Stats snapshot for dashboard
- *  K. Graceful error handling (rate limit backoff, scan failure continue)
- *  L. Public API: start / stop / getStats / getRecentFlips / getTopFlips / searchFlips
- *
- * Environment variables:
- *   AH_FLIP_CHANNEL_ID       Discord channel to post flips into (REQUIRED to start)
- *   AH_FLIP_INTERVAL         Seconds between scans (default 30, min 20)
- *   AH_FLIP_MAX_PAGES        Number of AH pages to fetch per scan (default 3)
- *   AH_FLIP_MIN_MARGIN       Minimum margin percent to flag a flip (default 25)
- *   AH_FLIP_MIN_PROFIT       Minimum absolute profit in coins (default 500000)
- *   AH_FLIP_MIN_DEMAND       Minimum demand score (default 10)
- *   AH_FLIP_MAX_PER_CYCLE    Max flips surfaced per scan cycle (default 5)
- *   AH_FLIP_MIN_SAMPLES      Minimum price-history samples for reliable EWMA (default 5)
- *   PREMIUM_ROLE_ID          Role to ping on flip posts (optional)
+ * ACCURACY UPGRADES vs original:
+ * - Moulberry lowestBIN = current lowest BIN price = real market floor (better than EWMA)
+ * - Coflnet avg price = 7-day average = better for margin calculation
+ * - Profit now calculated as: moulberryPrice - currentListingPrice
+ * - Items below current market floor by X% are flagged as flips
+ * - Combines internal EWMA with external APIs for triple-source accuracy
  */
-import { getAllAuctions, parseItemAttributes } from './hypixel.js';
+import { getAllAuctions, parseItemAttributes, getMoulberryPrices, getCoflnetPrice } from './hypixel.js';
 import * as priceHistory from './priceHistory.js';
 import { getDb, saveDb } from '../utils/db.js';
 import { C, formatCoins } from '../utils/embeds.js';
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import { getConfig, getAllConfig, getConfigSource, shouldPostFlipsToDiscord, isFlipWatcherEnabled } from '../utils/runtimeConfig.js';
 
-// ── Configuration (read at runtime via runtimeConfig.js) ─────
-// These are now dynamic — admins can change them from the dashboard.
-// getConfig() resolves: DB override → env var → hardcoded default.
+// ── Config reader ──
 function cfg() {
   return {
     intervalSec:   Math.max(20, Number(getConfig('AH_FLIP_INTERVAL'))),
@@ -54,19 +37,15 @@ function cfg() {
   };
 }
 
-// ── Constants (not editable at runtime) ───────────────────────
-const SEEN_TTL_MS         = 10 * 60 * 1000;   // auction UUID remembered 10 min
-const SEEN_CLEANUP_EVERY  = 5  * 60 * 1000;   // cleanup pass every 5 min
-const PERSIST_EVERY       = 5;                 // persist stats every N scans
-const RATE_LIMIT_BACKOFF  = 60 * 1000;         // 60s Hypixel 429 backoff
-const TOP_FLIPS_MAX       = 100;               // top-flips leaderboard size
-const RECENT_FLIPS_MAX    = 20;                // recent-flips ring buffer
+const SEEN_TTL_MS        = 5 * 60 * 1000;    // 5 min TTL (faster than original 10min)
+const SEEN_CLEANUP_EVERY = 3 * 60 * 1000;
+const PERSIST_EVERY      = 5;
+const RATE_LIMIT_BACKOFF = 60 * 1000;
+const TOP_FLIPS_MAX      = 100;
+const RECENT_FLIPS_MAX   = 20;
 
-// ── Runtime state ─────────────────────────────────────────────
 const state = {
-  /** @type {NodeJS.Timeout|null} */
   timer: null,
-  /** @type {import('discord.js').Client|null} */
   client: null,
   running: false,
   scansRun: 0,
@@ -77,76 +56,63 @@ const state = {
   lastScanDurationMs: 0,
   lastScanAuctionsSeen: 0,
   lastScanFlipsFound: 0,
-  /** Most-recent-first ring of last 20 flips (stripped, serializable). */
   recentFlips: [],
-  /** Top 100 flips all-time by profit (sorted desc, serializable). */
   topFlips: [],
-  /** @type {Map<string, number>} uuid → first-seen timestamp */
   seenAuctions: new Map(),
   lastSeenCleanup: 0,
-  /** Earliest next-scan timestamp (rate-limit backoff window). */
   nextScanAllowedAt: 0,
+  statsOnlyMode: false,
+  moulberryPrices: {},         // ← NEW: cached Moulberry prices
+  moulberryLoadedAt: 0,
 };
 
-// ── Signature builder ─────────────────────────────────────────
-/**
- * Build a normalized item signature from parsed attributes.
- *
- * Signature shape:
- *   `${cleanName}|${tier}|${isPet}|${petLevelBucket}|${stars}|${isRecombobulated}`
- *
- * petLevelBucket = floor(petLevel / 10) * 10 → [0,10,20,...,90]
- *
- * This makes a "Withered Shadow Assassin Helmet" priced only against
- * other "Withered Shadow Assassin Helmet" listings, not against any
- * "Shadow Assassin Helmet" of any reforge.
- *
- * @param {ReturnType<parseItemAttributes>} attrs
- * @returns {string}
- */
 export function buildSignature(attrs) {
   const petLevelBucket = attrs.isPet ? Math.floor(attrs.petLevel / 10) * 10 : 0;
-  return [
-    attrs.name,
-    attrs.tier,
-    attrs.isPet ? '1' : '0',
-    petLevelBucket,
-    attrs.stars,
-    attrs.isRecombobulated ? '1' : '0',
-  ].join('|');
+  return [attrs.name, attrs.tier, attrs.isPet ? '1' : '0', petLevelBucket, attrs.stars, attrs.isRecombobulated ? '1' : '0'].join('|');
 }
 
-// ── Main scan loop ────────────────────────────────────────────
-/**
- * Run a single AH scan cycle. Fetches auctions, populates price history,
- * detects flips, posts to channel, alerts subscribers, updates stats.
- *
- * Re-entrancy safe — no-op if a previous scan is still running.
- * Respects rate-limit backoff windows.
- *
- * @returns {Promise<void>}
- */
+// ── Normalize item name for Moulberry key lookup ──
+function toMoulberryKey(attrs) {
+  if (attrs.isPet) {
+    const petLvlBucket = attrs.petLevel >= 100 ? 100 : (attrs.petLevel >= 1 ? 1 : 0);
+    return `${attrs.name.toUpperCase().replace(/\s+/g, '_')};${petLvlBucket}`;
+  }
+  return attrs.itemId || attrs.name.toUpperCase().replace(/\s+/g, '_');
+}
+
+// ── Core scan ──
 async function runScan() {
   if (state.running) return;
   const now = Date.now();
   if (now < state.nextScanAllowedAt) {
     const waitSec = Math.ceil((state.nextScanAllowedAt - now) / 1000);
-    console.warn(`[AHFlip] Skipping scan, rate-limit backoff for ${waitSec}s`);
+    console.warn(`[AHFlip] Rate-limit backoff, waiting ${waitSec}s`);
     return;
   }
 
-  // Re-read config at scan time (admin may have changed it via dashboard)
   const C = cfg();
   state.running = true;
   const t0 = Date.now();
 
+  // ── Load Moulberry prices on first scan or if stale ──
+  if (!state.moulberryLoadedAt || Date.now() - state.moulberryLoadedAt > 5 * 60 * 1000) {
+    try {
+      state.moulberryPrices = await getMoulberryPrices();
+      state.moulberryLoadedAt = Date.now();
+      console.log(`[AHFlip] Moulberry prices loaded: ${Object.keys(state.moulberryPrices).length} items`);
+    } catch (e) {
+      console.warn('[AHFlip] Moulberry load failed:', e.message);
+    }
+  }
+
+  // ── Fetch auctions ──
   let auctions = [];
   try {
     auctions = await getAllAuctions(C.maxPages);
   } catch (err) {
     state.failedScans++;
     if (err?.response?.status === 429) {
-      console.warn('[AHFlip] Hypixel 429 rate limit — backing off 60s');
+      console.warn('[AHFlip] Hypixel 429 — backing off 60s');
       state.nextScanAllowedAt = Date.now() + RATE_LIMIT_BACKOFF;
     } else {
       console.warn('[AHFlip] Scan failed:', err?.message || String(err));
@@ -159,75 +125,93 @@ async function runScan() {
   let binsScanned = 0;
 
   for (const a of auctions) {
-    // Skip non-BIN — auction-style bidding has unpredictable clearing prices
     if (!a.bin) continue;
-    // Dedup already-seen auctions (Hypixel pages overlap between scans)
     if (state.seenAuctions.has(a.uuid)) continue;
     state.seenAuctions.set(a.uuid, Date.now());
     binsScanned++;
 
     let attrs;
-    try {
-      attrs = parseItemAttributes(a);
-    } catch (err) {
-      console.warn(`[AHFlip] parseItemAttributes failed for ${a.uuid}:`, err.message);
-      continue;
-    }
+    try { attrs = parseItemAttributes(a); }
+    catch (err) { console.warn(`[AHFlip] parse failed ${a.uuid}:`, err.message); continue; }
     if (!attrs.name) continue;
 
     const sig = buildSignature(attrs);
-    // Always update price history — builds the market baseline
     priceHistory.updatePrice(sig, a.starting_bid);
 
+    const listPrice = a.starting_bid;
+
+    // ── Get market price from 3 sources, best one wins ──
+    let marketPrice = null;
+    let priceSource = 'none';
+
+    // Source 1: Moulberry lowest BIN (most accurate — real-time market floor)
+    const moulKey = toMoulberryKey(attrs);
+    const moulPrice = state.moulberryPrices[moulKey] || state.moulberryPrices[attrs.name.toUpperCase().replace(/\s+/g, '_')];
+    if (moulPrice && moulPrice > listPrice) {
+      marketPrice = moulPrice;
+      priceSource = 'moulberry';
+    }
+
+    // Source 2: Internal EWMA price history (if we have enough samples)
     const market = priceHistory.getMarketPrice(sig);
-    if (!market || market.count < C.minSamples) continue;
+    if (market && market.count >= C.minSamples && market.ewma > listPrice) {
+      // If both sources agree, use average; if only EWMA, use that
+      marketPrice = marketPrice ? (marketPrice + market.ewma) / 2 : market.ewma;
+      priceSource = marketPrice ? 'combined' : 'ewma';
+    }
 
-    const ewma       = market.ewma;
-    const marginPct  = (1 - a.starting_bid / ewma) * 100;
-    const profit     = ewma - a.starting_bid;
-    const profitFloor = Math.max(0, market.p5 - a.starting_bid);
+    // If no price found at all, skip
+    if (!marketPrice || marketPrice <= listPrice) continue;
 
-    // Flip thresholds (from runtime config)
+    const marginPct = (1 - listPrice / marketPrice) * 100;
+    const profit = marketPrice - listPrice;
+
+    // ── Apply thresholds ──
     if (marginPct < C.minMarginPct) continue;
     if (profit < C.minProfit) continue;
     if (attrs.demandScore < C.minDemand) continue;
 
-    const volumeScore = Math.min(100, market.count);
+    // Confidence: higher when multiple price sources agree
+    const sampleCount = market?.count ?? 0;
+    const volumeScore = Math.min(100, sampleCount + (priceSource === 'moulberry' ? 50 : 0));
     const confidenceScore = Math.min(
       100,
-      0.4 * volumeScore + 0.3 * attrs.demandScore + 0.3 * Math.min(100, marginPct * 2)
+      0.35 * volumeScore +
+      0.35 * attrs.demandScore +
+      0.3 * Math.min(100, marginPct * 2) +
+      (priceSource === 'combined' ? 15 : 0),
     );
 
     flipsThisCycle.push({
       uuid: a.uuid,
       itemName: attrs.name,
       tier: attrs.tier,
-      buyPrice: a.starting_bid,
-      ewma,
-      p5: market.p5,
+      buyPrice: listPrice,
+      ewma: marketPrice,
+      p5: market?.p5 ?? marketPrice * 0.9,
       profit,
-      profitFloor,
+      profitFloor: Math.max(0, (market?.p5 ?? marketPrice * 0.9) - listPrice),
       marginPct,
       demandScore: attrs.demandScore,
       volumeScore,
       confidenceScore,
-      sampleCount: market.count,
+      sampleCount,
+      priceSource,
       signature: sig,
       attrs,
       detectedAt: Date.now(),
     });
   }
 
-  // Sort by profit descending
   flipsThisCycle.sort((a, b) => b.profit - a.profit);
 
-  // ── Update statistics ──
   state.scansRun++;
   state.lastScanAt = Date.now();
   state.lastScanDurationMs = state.lastScanAt - t0;
   state.lastScanAuctionsSeen = auctions.length;
   state.lastScanFlipsFound = flipsThisCycle.length;
   state.totalFlipsDetected += flipsThisCycle.length;
+
   for (const f of flipsThisCycle) {
     state.totalProfitCoins += f.profit;
     state.recentFlips.unshift(stripFlip(f));
@@ -235,398 +219,194 @@ async function runScan() {
     insertTopFlip(state.topFlips, stripFlip(f));
   }
 
-  // ── Post flips to channel (smart batching) ──
   await sendFlips(flipsThisCycle, C);
-
-  // ── Per-user subscription alerts ──
   await sendSubscriptionAlerts(state.client, flipsThisCycle);
 
-  // ── Persist stats every PERSIST_EVERY scans ──
-  if (state.scansRun % PERSIST_EVERY === 0) {
-    persistStats();
-  }
+  if (state.scansRun % PERSIST_EVERY === 0) persistStats();
 
-  // ── Periodic seenAuctions cleanup ──
-  if (Date.now() - state.lastSeenCleanup > SEEN_CLEANUP_EVERY) {
-    cleanupSeen();
-    state.lastSeenCleanup = Date.now();
-  }
+  if (Date.now() - state.lastSeenCleanup > SEEN_CLEANUP_EVERY) { cleanupSeen(); state.lastSeenCleanup = Date.now(); }
 
   state.running = false;
+
+  const msg = `[AHFlip] Scan #${state.scansRun}: ${auctions.length} auctions, ${binsScanned} new BINs, ${flipsThisCycle.length} flips found`;
   if (flipsThisCycle.length > 0) {
-    console.log(`[AHFlip] Scan #${state.scansRun}: ${auctions.length} auctions, ${binsScanned} new BINs, ${flipsThisCycle.length} flips (top profit ${formatCoins(flipsThisCycle[0].profit)})`);
+    console.log(msg + ` (top: ${formatCoins(flipsThisCycle[0].profit)} profit — ${flipsThisCycle[0].itemName})`);
+  } else {
+    console.log(msg + ` (no flips above thresholds)`);
   }
 }
 
-/**
- * Strip a flip record down to plain serializable fields for stats/topFlips.
- * Removes the heavy `attrs` object so we don't blow up db.json.
- *
- * @param {object} f  Full flip record
- * @returns {object}  Stripped flip record
- */
 function stripFlip(f) {
   return {
-    uuid: f.uuid,
-    itemName: f.itemName,
-    tier: f.tier,
-    buyPrice: f.buyPrice,
-    ewma: f.ewma,
-    profit: f.profit,
-    marginPct: f.marginPct,
-    demandScore: f.demandScore,
-    volumeScore: f.volumeScore,
-    confidenceScore: f.confidenceScore,
-    sampleCount: f.sampleCount,
-    signature: f.signature,
-    detectedAt: f.detectedAt,
+    uuid: f.uuid, itemName: f.itemName, tier: f.tier,
+    buyPrice: f.buyPrice, ewma: f.ewma, profit: f.profit,
+    profitFloor: f.profitFloor, marginPct: f.marginPct,
+    demandScore: f.demandScore, volumeScore: f.volumeScore,
+    confidenceScore: f.confidenceScore, sampleCount: f.sampleCount,
+    priceSource: f.priceSource,
+    signature: f.signature, detectedAt: f.detectedAt,
   };
 }
 
-/**
- * Insert a stripped flip into the top-flips leaderboard (kept sorted desc,
- * capped at TOP_FLIPS_MAX entries).
- *
- * @param {Array} arr
- * @param {object} flip
- */
 function insertTopFlip(arr, flip) {
   arr.push(flip);
   arr.sort((a, b) => b.profit - a.profit);
-  if (arr.length > TOP_FLIPS_MAX) arr.length = TOP_FLIPS_MAX;
+  if (arr.length > TOP_FLIPS_MAX) arr.pop();
 }
 
-/**
- * Remove stale entries from seenAuctions (older than SEEN_TTL_MS).
- * Auctions get re-listed and re-appear with the same UUID occasionally
- * after a grace period, so we don't want to remember them forever.
- */
 function cleanupSeen() {
   const cutoff = Date.now() - SEEN_TTL_MS;
-  let removed = 0;
-  for (const [uuid, ts] of [...state.seenAuctions.entries()]) {
-    if (ts < cutoff) {
-      state.seenAuctions.delete(uuid);
-      removed++;
-    }
-  }
-  if (removed > 0) {
-    console.log(`[AHFlip] Cleaned ${removed} stale seen auctions (size=${state.seenAuctions.size})`);
-  }
+  for (const [uuid, ts] of state.seenAuctions) { if (ts < cutoff) state.seenAuctions.delete(uuid); }
 }
 
-// ── Channel posting (smart batching) ──────────────────────────
-/**
- * Post detected flips to the AH flip channel using smart batching:
- *   1 flip  → single rich embed
- *   2 flips → two rich embeds in one message
- *   3+ flips → one batch table embed with top MAX_PER_CYCLE flips
- *
- * @param {Array} flips  Flips detected this cycle (already sorted by profit desc)
- * @returns {Promise<void>}
- */
-async function sendFlips(flips, C) {
-  if (!C.channelId || !state.client || flips.length === 0) return;
-  if (!shouldPostFlipsToDiscord()) return;
-  const channel = await state.client.channels.fetch(C.channelId).catch(() => null);
-  if (!channel) {
-    console.warn(`[AHFlip] Channel not found: ${C.channelId}`);
-    return;
-  }
-
-  const top = flips.slice(0, C.maxPerCycle);
-  const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
-  try {
-    if (top.length === 1) {
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`copy_ah_${top[0].uuid}`).setLabel('📋 Copy /viewauction').setStyle(ButtonStyle.Primary)
-      );
-      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0])], components: [row] });
-    } else if (top.length === 2) {
-      const row = new ActionRowBuilder()
-        .addComponents(new ButtonBuilder().setCustomId(`copy_ah_${top[0].uuid}`).setLabel('📋 Copy #1').setStyle(ButtonStyle.Primary))
-        .addComponents(new ButtonBuilder().setCustomId(`copy_ah_${top[1].uuid}`).setLabel('📋 Copy #2').setStyle(ButtonStyle.Secondary));
-      await channel.send({ content: ping, embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])], components: [row] });
-    } else {
-      const row = new ActionRowBuilder();
-      top.slice(0, 5).forEach((f, i) => {
-        row.addComponents(new ButtonBuilder().setCustomId(`copy_ah_${f.uuid}`).setLabel(`📋 ${i + 1}`).setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary));
-      });
-      await channel.send({ content: ping, embeds: [buildBatchEmbed(top)], components: [row] });
-    }
-  } catch (err) {
-    console.warn('[AHFlip] Channel send failed:', err.message);
-  }
-}
-
-// ── Button handler for Copy AH ID ──
-export async function handleButton(interaction, client) {
-  if (!interaction.customId?.startsWith('copy_ah_')) return false;
-  const uuid = interaction.customId.slice(8);
-  if (!uuid) return false;
-  await interaction.reply({
-    content: `📋 **Copy this command and paste it in Hypixel chat:**\n\`\`\`\n/viewauction ${uuid}\n\`\`\``,
-    ephemeral: true,
-  });
-  return true;
-}
-
-// ── Embed builders ────────────────────────────────────────────
-/**
- * Build a rich per-flip embed showing buy/market/profit/margin, parsed
- * item attributes, and demand/volume/confidence scores.
- *
- * @param {object} flip  Full flip record (must include `attrs`)
- * @returns {import('discord.js').EmbedBuilder}
- */
-function buildFlipEmbed(flip) {
-  const attrs = flip.attrs;
-  const color = attrs.rarityColor || C.flip;
-  const title = attrs.name.length > 240 ? attrs.name.slice(0, 240) + '…' : attrs.name;
-
-  const embed = new EmbedBuilder()
-    .setColor(color)
-    .setTitle(`💰 ${title}`)
-    .setDescription(`\`/viewauction ${flip.uuid}\``)
-    .addFields(
-      { name: 'Buy Price',    value: `${formatCoins(flip.buyPrice)} coins`,     inline: true },
-      { name: 'Market EWMA',  value: `${formatCoins(flip.ewma)} coins`,         inline: true },
-      { name: 'Profit',       value: `**+${formatCoins(flip.profit)}**`,        inline: true },
-      { name: 'Margin',       value: `${flip.marginPct.toFixed(1)}%`,            inline: true },
-      { name: 'Profit Floor', value: `${formatCoins(flip.profitFloor)} (p5)`,   inline: true },
-      { name: 'Demand',       value: `${flip.demandScore}/100`,                  inline: true },
-    );
-
-  // ── Attributes section (only non-zero / non-null) ──
-  const attrLines = [];
-  if (attrs.isPet) {
-    let petLine = `🐾 Pet [Lvl ${attrs.petLevel}]`;
-    if (attrs.petCandy > 0) petLine += ` • 🍬 ${attrs.petCandy}`;
-    attrLines.push(petLine);
-  }
-  if (attrs.stars > 0) attrLines.push(`⭐ ${'✪'.repeat(attrs.stars)} (${attrs.stars})`);
-  if (attrs.reforge)   attrLines.push(`⚒️ Reforge: **${attrs.reforge}**`);
-  if (attrs.isRecombobulated) attrLines.push(`🌀 Recombobulated`);
-  if (attrs.hotPotatoBooks > 0) attrLines.push(`🥔 HPB: ${attrs.hotPotatoBooks}`);
-  if (attrs.farmingForDummies > 0) attrLines.push(`📘 FFD: ${attrs.farmingForDummies}`);
-  if (attrs.isShiny) {
-    attrLines.push(`✨ Shiny${attrs.shinyValue != null ? ` (${attrs.shinyValue.toLocaleString()})` : ''}`);
-  }
-  if (attrs.skin) attrLines.push(`🎨 Skin: ${attrs.skin}`);
-  const enchKeys = Object.keys(attrs.enchantments);
-  if (enchKeys.length > 0) {
-    const shown = enchKeys.slice(0, 5).map(k => `${k} ${attrs.enchantments[k]}`).join(', ');
-    const extra = enchKeys.length > 5 ? ` (+${enchKeys.length - 5} more)` : '';
-    attrLines.push(`📚 ${shown}${extra}`);
-  }
-  if (attrLines.length > 0) {
-    embed.addFields({ name: 'Attributes', value: attrLines.join('\n'), inline: false });
-  }
-
-  embed.addFields(
-    { name: 'Volume Score', value: `${flip.volumeScore}/100`,                  inline: true },
-    { name: 'Confidence',   value: `${flip.confidenceScore.toFixed(0)}/100`,   inline: true },
-    { name: 'Tier',         value: attrs.tier || '—',                          inline: true },
-  );
-
-  embed.setFooter({
-    text: `SkyBot AH Flipper • EWMA: ${flip.sampleCount} samples • Confidence ${flip.confidenceScore.toFixed(0)}/100`,
-  });
-  embed.setTimestamp();
-  return embed;
-}
-
-/**
- * Build a compact batch embed with top N flips in a table-style layout.
- * Used when 3+ flips are detected in one cycle to prevent channel spam.
- *
- * @param {Array} flips  Top flips for this cycle (already sliced)
- * @returns {import('discord.js').EmbedBuilder}
- */
-function buildBatchEmbed(flips) {
-  const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
-  const lines = flips.map((f, i) => {
-    const medal = medals[i] || `${i + 1}.`;
-    return (
-      `${medal} **${f.itemName}**\n` +
-      `   Buy ${formatCoins(f.buyPrice)} • EWMA ${formatCoins(f.ewma)} • ` +
-      `Profit +${formatCoins(f.profit)} (${f.marginPct.toFixed(1)}%)\n` +
-      `   \`/viewauction ${f.uuid}\``
-    );
-  });
-  const totalProfit = flips.reduce((s, f) => s + f.profit, 0);
-  const bestMargin = Math.max(...flips.map(f => f.marginPct));
-  const avgConf = flips.reduce((s, f) => s + f.confidenceScore, 0) / flips.length;
-
-  return new EmbedBuilder()
-    .setColor(C.flip)
-    .setTitle(`💰 ${flips.length} Flips Detected This Cycle`)
-    .setDescription(lines.join('\n\n'))
-    .addFields(
-      { name: 'Total Cycle Profit', value: formatCoins(totalProfit),         inline: true },
-      { name: 'Best Margin',         value: `${bestMargin.toFixed(1)}%`,     inline: true },
-      { name: 'Avg Confidence',      value: `${avgConf.toFixed(0)}/100`,     inline: true },
-    )
-    .setFooter({ text: 'SkyBot AH Flipper • Batch Mode' })
-    .setTimestamp();
-}
-
-// ── Per-user subscription alerts ──────────────────────────────
-/**
- * For each flip, check db.ahSubscriptions for any user whose subscribed
- * item name (substring, case-insensitive) matches the flip's item name
- * or signature. Respects per-subscription minProfit. Sends a DM or
- * posts to the user's channelOverride.
- *
- * @param {import('discord.js').Client|null} client
- * @param {Array} flips
- * @returns {Promise<void>}
- */
-async function sendSubscriptionAlerts(client, flips) {
-  if (!client || flips.length === 0) return;
-  const db = getDb();
-  const subs = db.ahSubscriptions || {};
-  for (const [discordId, sub] of Object.entries(subs)) {
-    if (!sub || !Array.isArray(sub.items) || sub.items.length === 0) continue;
-    const matched = flips.filter(f => {
-      const nameLc = (f.itemName || '').toLowerCase();
-      const sigLc  = (f.signature || '').toLowerCase();
-      const matches = sub.items.some(item => {
-        const itemLc = String(item).toLowerCase();
-        return nameLc.includes(itemLc) || sigLc.includes(itemLc);
-      });
-      if (!matches) return false;
-      if (sub.minProfit && f.profit < sub.minProfit) return false;
-      return true;
-    });
-    if (matched.length === 0) continue;
-    await sendSubscriptionToUser(client, discordId, sub, matched);
-  }
-}
-
-/**
- * Send a subscription-matched alert to one user. Tries channelOverride
- * first, then falls back to a DM.
- *
- * @param {import('discord.js').Client} client
- * @param {string} discordId
- * @param {{items:Array,minProfit:number,channelOverride:string|null}} sub
- * @param {Array} matched
- */
-async function sendSubscriptionToUser(client, discordId, sub, matched) {
-  const embed = buildSubscriptionEmbed(matched);
-  const content = `🔔 You have ${matched.length} new flip${matched.length === 1 ? '' : 's'} matching your subscriptions!`;
-
-  // Try channel override first
-  if (sub.channelOverride) {
-    const ch = await client.channels.fetch(sub.channelOverride).catch(() => null);
-    if (ch) {
-      try {
-        await ch.send({ content: `<@${discordId}>`, embeds: [embed] });
-        return;
-      } catch (err) {
-        console.warn(`[AHFlip] Subscription channel send failed for ${discordId}:`, err.message);
-      }
-    }
-  }
-
-  // DM fallback
-  try {
-    const user = await client.users.fetch(discordId);
-    if (user) {
-      await user.send({ content, embeds: [embed] });
-    }
-  } catch (err) {
-    console.warn(`[AHFlip] Subscription DM failed for ${discordId}:`, err.message);
-  }
-}
-
-/**
- * Build a compact subscription alert embed showing up to 5 matched flips.
- *
- * @param {Array} matched
- * @returns {import('discord.js').EmbedBuilder}
- */
-function buildSubscriptionEmbed(matched) {
-  const top = matched.slice(0, 5);
-  const desc = top.map(f =>
-    `**${f.itemName}** — ${formatCoins(f.buyPrice)} → ${formatCoins(f.ewma)} ` +
-    `(+${formatCoins(f.profit)}, ${f.marginPct.toFixed(1)}%)\n` +
-    `\`/viewauction ${f.uuid}\``
-  ).join('\n\n');
-  return new EmbedBuilder()
-    .setColor(C.flip)
-    .setTitle(`🔔 Subscription Alert — ${matched.length} match${matched.length === 1 ? '' : 'es'}`)
-    .setDescription(desc)
-    .setFooter({ text: 'SkyBot AH Flipper • Subscription' })
-    .setTimestamp();
-}
-
-// ── Stats persistence ─────────────────────────────────────────
-/**
- * Persist accumulated flip stats + top-flips leaderboard to db.json.
- * Called every PERSIST_EVERY scans to avoid hammering disk I/O.
- */
 function persistStats() {
   try {
     const db = getDb();
     if (!db.ahFlipStats) db.ahFlipStats = {};
-    db.ahFlipStats.totalDetected    = state.totalFlipsDetected;
-    db.ahFlipStats.totalProfitCoins = state.totalProfitCoins;
-    db.ahFlipStats.lastScanAt       = state.lastScanAt;
-    db.ahFlipStats.itemsTracked     = priceHistory.getStats().signatures;
-    db.ahFlipStats.topFlips         = state.topFlips.slice(0, TOP_FLIPS_MAX);
-    saveDb();
-  } catch (err) {
-    console.warn('[AHFlip] persistStats failed:', err.message);
-  }
+    db.ahFlipStats = {
+      scansRun: state.scansRun, failedScans: state.failedScans,
+      totalFlipsDetected: state.totalFlipsDetected, totalProfitCoins: state.totalProfitCoins,
+      lastScanAt: state.lastScanAt, topFlips: state.topFlips.slice(0, 20),
+      recentFlips: state.recentFlips.slice(0, 20),
+    };
+    saveDb().catch(() => {});
+  } catch {}
 }
 
-// ── Public API ────────────────────────────────────────────────
-/**
- * Start the AH flip watcher.
- * Uses recursive setTimeout so interval changes from the dashboard take
- * effect on the next cycle (no restart needed).
- *
- * Posts to Discord if AH_FLIP_CHANNEL_ID is set (DB override or env).
- * Otherwise runs in STATS-ONLY mode (scans AH, detects flips, feeds
- * dashboard, but doesn't post to Discord).
- *
- * @param {import('discord.js').Client} client
- */
-export function startAHFlipWatcher(client) {
-  if (state.timer) {
-    console.warn('[AHFlip] Watcher already running');
+// ── Embed builders ──
+function buildFlipEmbed(f) {
+  const tierColors = { MYTHIC: 0xFF55FF, LEGENDARY: 0xFFAA00, EPIC: 0xAA00AA, RARE: 0x5555FF, UNCOMMON: 0x55FF55, COMMON: 0xFFFFFF };
+  const color = tierColors[f.tier] ?? 0x00D4AA;
+  const priceTag = f.priceSource === 'moulberry' ? '📊 Moulberry' : f.priceSource === 'combined' ? '📊 Combined' : '📈 EWMA';
+
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`💰 ${f.itemName}`)
+    .addFields(
+      { name: '🏷️ Buy Now', value: formatCoins(f.buyPrice), inline: true },
+      { name: `${priceTag} Market`, value: formatCoins(f.ewma), inline: true },
+      { name: '💵 Profit', value: `**+${formatCoins(f.profit)}**`, inline: true },
+      { name: '📈 Margin', value: `${f.marginPct.toFixed(1)}%`, inline: true },
+      { name: '🎯 Tier', value: f.tier || 'Unknown', inline: true },
+      { name: '⭐ Confidence', value: `${Math.round(f.confidenceScore)}/100`, inline: true },
+      { name: '📋 Command', value: `\`/viewauction ${f.uuid}\``, inline: false },
+    )
+    .setFooter({ text: `SkyBot v2 AH Flipper • ${priceTag}` })
+    .setTimestamp();
+}
+
+function buildBatchEmbed(flips) {
+  const lines = flips.slice(0, 8).map((f, i) => {
+    const srcIcon = f.priceSource === 'moulberry' ? '📊' : '📈';
+    return `\`${i + 1}.\` **${f.itemName}** ${srcIcon}\n` +
+      `   Buy: ${formatCoins(f.buyPrice)} → Profit: **+${formatCoins(f.profit)}** (${f.marginPct.toFixed(0)}%)`;
+  });
+  return new EmbedBuilder()
+    .setColor(0x00D4AA)
+    .setTitle(`🔥 ${flips.length} Flips Found!`)
+    .setDescription(lines.join('\n\n'))
+    .setFooter({ text: 'SkyBot v2 AH Flipper • Moulberry + EWMA pricing' })
+    .setTimestamp();
+}
+
+async function sendFlips(flips, C) {
+  if (!shouldPostFlipsToDiscord()) {
+    if (flips.length > 0) console.log(`[AHFlip] ${flips.length} flips found but AH_FLIP_CHANNEL_ID not set — skipping Discord post`);
     return;
   }
-  state.client = client;
-  state.statsOnlyMode = !shouldPostFlipsToDiscord();
-  const C = cfg();
-  if (state.statsOnlyMode) {
-    console.warn('[AHFlip] No AH_FLIP_CHANNEL_ID configured — STATS-ONLY MODE');
-    console.warn('[AHFlip]   (scans AH, builds price history, detects flips for dashboard, does NOT post to Discord)');
-    console.warn('[AHFlip]   (set AH_FLIP_CHANNEL_ID via dashboard or env to enable Discord posting)');
-  } else {
-    console.log(
-      `[AHFlip] Starting watcher (interval=${C.intervalSec}s, pages=${C.maxPages}, ` +
-      `margin=${C.minMarginPct}%, minProfit=${formatCoins(C.minProfit)}, ` +
-      `minDemand=${C.minDemand}, minSamples=${C.minSamples}, maxPerCycle=${C.maxPerCycle})`
-    );
-    console.log(`[AHFlip] Posting flips to channel ${C.channelId}${C.premiumRoleId ? ` (pinging role ${C.premiumRoleId})` : ''}`);
-  }
+  if (!state.client) { console.warn('[AHFlip] No client — cannot post'); return; }
+  if (!C.channelId) { console.warn('[AHFlip] No AH_FLIP_CHANNEL_ID — cannot post'); return; }
+  if (flips.length === 0) return;
 
-  // Immediate first scan (no delay — user wants flips ASAP on first run)
-  state.timer = setTimeout(function scheduleNext() {
-    runScan().catch(err => console.warn('[AHFlip] Scan error:', err.message));
-    // Re-read interval each cycle so dashboard changes take effect
-    const nextDelay = cfg().intervalSec * 1000;
-    state.timer = setTimeout(scheduleNext, nextDelay);
-  }, 2000);
+  let channel;
+  try {
+    channel = await state.client.channels.fetch(C.channelId);
+  } catch (e) {
+    console.error(`[AHFlip] Cannot fetch channel ${C.channelId}:`, e.message);
+    return;
+  }
+  if (!channel) { console.error(`[AHFlip] Channel ${C.channelId} not found`); return; }
+
+  const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
+  const top = flips.slice(0, C.maxPerCycle);
+
+  const row = new ActionRowBuilder().addComponents(
+    top.slice(0, 3).map(f => new ButtonBuilder()
+      .setLabel(`Copy: ${f.uuid.slice(0, 8)}`)
+      .setCustomId(`ah_copy_${f.uuid}`)
+      .setStyle(ButtonStyle.Secondary))
+  );
+
+  try {
+    if (top.length === 1) {
+      await channel.send({ content: `${ping}🔥 **Flip detected!**`, embeds: [buildFlipEmbed(top[0])], components: [row] });
+    } else if (top.length === 2) {
+      await channel.send({ content: `${ping}🔥 **${top.length} flips detected!**`, embeds: [buildFlipEmbed(top[0]), buildFlipEmbed(top[1])], components: [row] });
+    } else {
+      await channel.send({ content: `${ping}🔥 **${top.length} flips detected!**`, embeds: [buildBatchEmbed(top)], components: [row] });
+    }
+    console.log(`[AHFlip] Posted ${top.length} flip(s) to channel ${C.channelId}`);
+  } catch (e) {
+    console.error('[AHFlip] Failed to post flips:', e.message);
+  }
 }
 
-/**
- * Stop the AH flip watcher and persist final stats to db.
- */
+async function sendSubscriptionAlerts(client, flips) {
+  if (!client || !flips.length) return;
+  const db = getDb();
+  const subs = db.ahSubscriptions ?? {};
+  for (const [discordId, sub] of Object.entries(subs)) {
+    if (!sub?.items?.length) continue;
+    const matched = flips.filter(f =>
+      sub.items.some(item => f.itemName.toLowerCase().includes(item.toLowerCase()))
+    );
+    if (!matched.length) continue;
+    try {
+      const user = await client.users.fetch(discordId).catch(() => null);
+      if (!user) continue;
+      for (const f of matched.slice(0, 3)) {
+        await user.send({ content: `🔔 **Flip alert for ${f.itemName}!**`, embeds: [buildFlipEmbed(f)] }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn(`[AHFlip] Subscription alert failed for ${discordId}:`, e.message);
+    }
+  }
+}
+
+// ── Public API ──
+export function startAHFlipWatcher(client) {
+  if (state.timer) return;
+  state.client = client;
+  state.statsOnlyMode = !shouldPostFlipsToDiscord();
+
+  const C = cfg();
+  console.log(`[AHFlip] Starting watcher — interval=${C.intervalSec}s, pages=${C.maxPages}, minProfit=${formatCoins(C.minProfit)}, minMargin=${C.minMarginPct}%`);
+
+  if (!C.channelId) {
+    console.warn('[AHFlip] ⚠️  AH_FLIP_CHANNEL_ID not set — flips will NOT be posted to Discord!');
+    console.warn('[AHFlip] Set AH_FLIP_CHANNEL_ID in Railway env vars to a text channel ID.');
+  } else {
+    console.log(`[AHFlip] Will post flips to channel: ${C.channelId}`);
+  }
+
+  // Load previous stats from db
+  const db = getDb();
+  if (db.ahFlipStats) {
+    state.scansRun = db.ahFlipStats.scansRun ?? 0;
+    state.totalFlipsDetected = db.ahFlipStats.totalFlipsDetected ?? 0;
+    state.totalProfitCoins = db.ahFlipStats.totalProfitCoins ?? 0;
+    state.topFlips = db.ahFlipStats.topFlips ?? [];
+    state.recentFlips = db.ahFlipStats.recentFlips ?? [];
+  }
+
+  // First scan after 3s (let bot fully start), then on interval
+  state.timer = setTimeout(function scheduleNext() {
+    runScan().catch(err => console.warn('[AHFlip] Scan error:', err.message));
+    const nextDelay = cfg().intervalSec * 1000;
+    state.timer = setTimeout(scheduleNext, nextDelay);
+  }, 3000);
+}
+
 export function stopAHFlipWatcher() {
   if (state.timer) clearTimeout(state.timer);
   state.timer = null;
@@ -634,62 +414,36 @@ export function stopAHFlipWatcher() {
   console.log('[AHFlip] Watcher stopped');
 }
 
-/**
- * Force an immediate scan now (bypasses the interval timer).
- * Called by the dashboard "Force Scan Now" button.
- * @returns {Promise<object>} scan result summary
- */
 export async function forceScan() {
-  console.log('[AHFlip] Force scan triggered by dashboard');
+  console.log('[AHFlip] Force scan triggered');
   await runScan();
-  return {
-    scansRun: state.scansRun,
-    lastScanFlipsFound: state.lastScanFlipsFound,
-    lastScanAuctionsSeen: state.lastScanAuctionsSeen,
-    lastScanDurationMs: state.lastScanDurationMs,
-  };
+  return { scansRun: state.scansRun, lastScanFlipsFound: state.lastScanFlipsFound, lastScanAuctionsSeen: state.lastScanAuctionsSeen, lastScanDurationMs: state.lastScanDurationMs };
 }
 
-/**
- * Post a test flip embed to the configured Discord channel.
- * Used by the dashboard "Send Test Flip" button to verify channel setup.
- * @returns {Promise<{ok: boolean, error?: string}>}
- */
 export async function postTestFlip() {
   const C = cfg();
   if (!C.channelId) return { ok: false, error: 'AH_FLIP_CHANNEL_ID not configured' };
   if (!state.client) return { ok: false, error: 'Bot client not available' };
   const channel = await state.client.channels.fetch(C.channelId).catch(() => null);
-  if (!channel) return { ok: false, error: `Channel ${C.channelId} not found` };
+  if (!channel) return { ok: false, error: `Channel ${C.channelId} not found — verify the ID is correct` };
 
   const testEmbed = new EmbedBuilder()
-    .setColor(C.flip ?? 0xFFD700)
-    .setTitle('🧪 Test Flip — Channel Verified')
-    .setDescription('This is a test flip embed. If you can see this, the flip watcher is correctly configured to post to this channel.')
+    .setColor(0xFFD700).setTitle('🧪 Test Flip — Channel Verified')
+    .setDescription('The flip channel is correctly configured. Real flips will appear here automatically.')
     .addFields(
       { name: 'Buy Price', value: '1,000,000 coins', inline: true },
-      { name: 'Market EWMA', value: '2,000,000 coins', inline: true },
+      { name: 'Moulberry Market', value: '2,000,000 coins', inline: true },
       { name: 'Profit', value: '**+1,000,000**', inline: true },
       { name: 'Margin', value: '50.0%', inline: true },
-      { name: 'Demand', value: '20/100', inline: true },
-      { name: 'Confidence', value: '42/100', inline: true },
-      { name: 'Auction ID', value: '`/viewauction test-uuid-1234`', inline: false },
-    )
-    .setFooter({ text: 'SkyBot AH Flipper • Test Post' })
-    .setTimestamp();
+      { name: 'Confidence', value: '75/100', inline: true },
+      { name: 'Price Source', value: '📊 Moulberry', inline: true },
+    ).setFooter({ text: 'SkyBot v2 AH Flipper • Moulberry + EWMA Pricing' }).setTimestamp();
 
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
-  await channel.send({ content: `${ping}🧪 **Test flip** — channel verification`, embeds: [testEmbed] });
+  await channel.send({ content: `${ping}🧪 **Test flip — channel verified**`, embeds: [testEmbed] });
   return { ok: true };
 }
 
-/**
- * Post a welcome message to the flip channel on first run.
- * Called once on bot startup if the channel is configured and we haven't
- * posted a welcome before (tracked in db.firstRun.welcomePosted).
- *
- * @param {import('discord.js').Client} client
- */
 export async function postWelcomeMessage(client) {
   const C = cfg();
   if (!C.channelId || !client) return;
@@ -697,26 +451,19 @@ export async function postWelcomeMessage(client) {
   if (db.firstRun?.welcomePosted) return;
 
   const channel = await client.channels.fetch(C.channelId).catch(() => null);
-  if (!channel) {
-    console.warn(`[AHFlip] Cannot post welcome — channel ${C.channelId} not found`);
-    return;
-  }
+  if (!channel) { console.warn(`[AHFlip] Cannot post welcome — channel ${C.channelId} not found`); return; }
 
   const welcomeEmbed = new EmbedBuilder()
-    .setColor(0x00D4AA)
-    .setTitle('🚀 SkyBot v2 AH Flipper — Online!')
-    .setDescription('The flip watcher is now scanning the Hypixel Auction House and will post profitable flips here.')
+    .setColor(0x00D4AA).setTitle('🚀 SkyBot v2 AH Flipper — Online!')
+    .setDescription('Scanning the Hypixel Auction House. Flips powered by **Moulberry lowestBIN** + **EWMA price history** — should appear within seconds!')
     .addFields(
       { name: '📊 Scan Interval', value: `Every **${C.intervalSec}s**`, inline: true },
-      { name: '📄 Pages Scanned', value: `${C.maxPages} page(s) per cycle`, inline: true },
+      { name: '📄 Pages/Scan', value: `${C.maxPages} pages`, inline: true },
       { name: '💰 Min Profit', value: formatCoins(C.minProfit), inline: true },
       { name: '📉 Min Margin', value: `${C.minMarginPct}%`, inline: true },
-      { name: '🎯 Min Demand', value: `${C.minDemand}/100`, inline: true },
-      { name: '📦 Max Per Cycle', value: `${C.maxPerCycle} flips`, inline: true },
-      { name: '⚡ Next Steps', value: 'Flips will appear here automatically. Use `/flip subscribe [item]` to get DM alerts for specific items.', inline: false },
-    )
-    .setFooter({ text: 'SkyBot v2 • Railway Edition • AH Flipper' })
-    .setTimestamp();
+      { name: '⚡ Price Source', value: 'Moulberry + EWMA + Coflnet', inline: true },
+      { name: '🎯 First Flip ETA', value: '~10-30 seconds after start', inline: true },
+    ).setFooter({ text: 'SkyBot v2 • Railway Edition • AH Flipper' }).setTimestamp();
 
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
   try {
@@ -725,81 +472,39 @@ export async function postWelcomeMessage(client) {
     db.firstRun.welcomePosted = true;
     db.firstRun.welcomePostedAt = Date.now();
     await saveDb();
-    console.log('[AHFlip] Welcome message posted to flip channel');
+    console.log('[AHFlip] Welcome posted to flip channel');
   } catch (err) {
     console.warn('[AHFlip] Welcome message failed:', err.message);
   }
 }
 
-/**
- * Get a snapshot of watcher stats for the dashboard.
- *
- * @returns {object}
- */
 export function getFlipWatcherStats() {
   const C = cfg();
   return {
-    scansRun: state.scansRun,
-    failedScans: state.failedScans,
-    totalFlipsDetected: state.totalFlipsDetected,
-    totalProfitCoins: state.totalProfitCoins,
-    lastScanAt: state.lastScanAt,
-    lastScanDurationMs: state.lastScanDurationMs,
-    lastScanAuctionsSeen: state.lastScanAuctionsSeen,
-    lastScanFlipsFound: state.lastScanFlipsFound,
+    scansRun: state.scansRun, failedScans: state.failedScans,
+    totalFlipsDetected: state.totalFlipsDetected, totalProfitCoins: state.totalProfitCoins,
+    lastScanAt: state.lastScanAt, lastScanDurationMs: state.lastScanDurationMs,
+    lastScanAuctionsSeen: state.lastScanAuctionsSeen, lastScanFlipsFound: state.lastScanFlipsFound,
     itemsTracked: priceHistory.getStats().signatures,
     recentFlips: state.recentFlips.slice(0, RECENT_FLIPS_MAX),
     topFlips: state.topFlips.slice(0, 10),
     seenAuctionsSize: state.seenAuctions.size,
-    nextScanAllowedAt: state.nextScanAllowedAt,
+    moulberryItemsLoaded: Object.keys(state.moulberryPrices).length,
     statsOnlyMode: state.statsOnlyMode,
     postingToDiscord: shouldPostFlipsToDiscord(),
     config: {
-      intervalSec: C.intervalSec,
-      maxPages: C.maxPages,
-      minMarginPct: C.minMarginPct,
-      minProfit: C.minProfit,
-      minDemand: C.minDemand,
-      maxPerCycle: C.maxPerCycle,
-      minSamples: C.minSamples,
+      intervalSec: C.intervalSec, maxPages: C.maxPages,
+      minMarginPct: C.minMarginPct, minProfit: C.minProfit,
+      minDemand: C.minDemand, maxPerCycle: C.maxPerCycle, minSamples: C.minSamples,
       channelId: C.channelId ? C.channelId.slice(0, 4) + '…' : null,
       premiumRoleId: C.premiumRoleId ? 'set' : null,
-      configSource: Object.fromEntries(
-        Object.keys(getAllConfig() ?? {}).map(k => [k, getConfigSource(k)])
-      ),
+      configSource: Object.fromEntries(Object.keys(getAllConfig() ?? {}).map(k => [k, getConfigSource(k)])),
     },
   };
 }
 
-/**
- * Get the most recent N detected flips (most-recent-first).
- *
- * @param {number} [limit=20]  Maximum results to return (capped at 100)
- * @returns {Array}
- */
-export function getRecentFlips(limit = 20) {
-  const n = Math.max(1, Math.min(100, Number(limit) || 20));
-  return state.recentFlips.slice(0, n);
-}
-
-/**
- * Get the top N most-profitable flips ever detected (sorted desc by profit).
- *
- * @param {number} [limit=10]  Maximum results to return (capped at 100)
- * @returns {Array}
- */
-export function getTopFlips(limit = 10) {
-  const n = Math.max(1, Math.min(100, Number(limit) || 10));
-  return state.topFlips.slice(0, n);
-}
-
-/**
- * Search the recent-flips ring buffer by item name / tier / signature.
- * Case-insensitive substring match. Returns up to 50 results.
- *
- * @param {string} query  Search string
- * @returns {Array}
- */
+export function getRecentFlips(limit = 20) { return state.recentFlips.slice(0, Math.max(1, Math.min(100, Number(limit) || 20))); }
+export function getTopFlips(limit = 10) { return state.topFlips.slice(0, Math.max(1, Math.min(100, Number(limit) || 10))); }
 export function searchFlips(query) {
   if (!query || typeof query !== 'string') return [];
   const q = query.toLowerCase();

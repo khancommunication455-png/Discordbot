@@ -1,14 +1,13 @@
 # ─────────────────────────────────────────────────────────────
-# SkyBot v2 — Railway Nixpacks Config
+# SkyBot v2 — Railway Nixpacks Config (FIXED)
 # ─────────────────────────────────────────────────────────────
-# Packages installed:
-#   - nodejs_20       : runtime
-#   - ffmpeg-headless : TTS + music audio transcoding
-#   - yt-dlp          : /music + /download (YouTube, TikTok, etc.)
-#   - python3         : needed by node-gyp to compile @discordjs/opus
-#                       (native opus encoder for Discord voice)
-#   - gcc             : C compiler for native module compilation
-#   - make            : build tool for native modules
+# CRITICAL NOTES:
+# 1. We use opusscript (pure JS) NOT @discordjs/opus (native C++)
+#    @discordjs/opus compilation fails on Railway glibc mismatch
+# 2. prism-media is REMOVED — we use ffmpeg stdin pipe instead
+#    (prism-media's duplex stream causes silence on Railway)
+# 3. ffmpeg-headless is the correct Railway nix package (not ffmpeg)
+# 4. yt-dlp for music and video downloads
 # ─────────────────────────────────────────────────────────────
 
 [phases.setup]
@@ -16,12 +15,13 @@ nixPkgs = ["nodejs_20", "ffmpeg-headless", "yt-dlp", "python3", "gcc", "gnumake"
 
 [variables]
 NODE_ENV = "production"
+FFMPEG_PATH = "/root/.nix-profile/bin/ffmpeg"
 
 [phases.install]
-cmds = ["npm install"]
+cmds = ["npm install --omit=dev"]
 
 [phases.build]
-cmds = ["echo 'No build step needed for SkyBot v2'"]
+cmds = ["echo 'No build step needed'"]
 
 [start]
 cmd = "node src/index.js"
