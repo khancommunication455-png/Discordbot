@@ -149,21 +149,48 @@ function playMP3(state, mp3Buffer) {
     // StreamType.OggOpus = PASSTHROUGH — no @discordjs/opus needed!
     const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus, inlineVolume: false });
 
-    const statusHandler = (oldState, newState) => {
+    // Track player state changes using the CORRECT event: 'stateChange'
+    // NOT AudioPlayerStatus.Transitioning (that's a state value, not an event)
+    let hasPlayed = false;
+    const stateChangeHandler = (oldState, newState) => {
       console.log(`[TTS] Player: ${oldState.status} → ${newState.status}`);
-      if (newState.status === AudioPlayerStatus.Playing) console.log('[TTS] PLAYING ✅ (audio audible in VC)');
-      if (newState.status === AudioPlayerStatus.Idle && oldState.status === AudioPlayerStatus.Playing) {
-        state.player.off(AudioPlayerStatus.Transitioning, statusHandler); finish();
+      if (newState.status === AudioPlayerStatus.Playing) {
+        hasPlayed = true;
+        console.log('[TTS] PLAYING ✅ (audio audible in VC)');
+      }
+      // Only finish when player goes from Playing → Idle (playback complete)
+      if (newState.status === AudioPlayerStatus.Idle && hasPlayed) {
+        console.log('[TTS] Playback complete');
+        state.player.off('stateChange', stateChangeHandler);
+        finish();
       }
     };
-    state.player.on(AudioPlayerStatus.Transitioning, statusHandler);
-    state.player.once(AudioPlayerStatus.Idle, () => { console.log('[TTS] Player Idle'); finish(); });
-    state.player.once('error', (err) => { console.error('[TTS] Player error:', err.message); state.player.off(AudioPlayerStatus.Transitioning, statusHandler); finish(err); });
+    state.player.on('stateChange', stateChangeHandler);
 
-    try { state.player.play(resource); console.log('[TTS] player.play() (OggOpus passthrough)'); }
-    catch (e) { console.error('[TTS] play() threw:', e.message); finish(e); }
+    state.player.once('error', (err) => {
+      console.error('[TTS] Player error:', err.message);
+      state.player.off('stateChange', stateChangeHandler);
+      finish(err);
+    });
 
-    setTimeout(() => { if (!settled) { console.error(`[TTS] TIMEOUT: ogg=${oggBytes}B, status=${state.player.state?.status}`); finish(new Error('timeout')); } }, 15_000);
+    try {
+      state.player.play(resource);
+      console.log('[TTS] player.play() (OggOpus passthrough)');
+    } catch (e) {
+      console.error('[TTS] play() threw:', e.message);
+      finish(e);
+    }
+
+    // Safety timeout — if player never reaches Playing after 15s, something is wrong
+    setTimeout(() => {
+      if (!settled) {
+        console.error('[TTS] TIMEOUT: No playback after 15s');
+        console.error(`[TTS]   OggOpus: ${oggBytes}B, hasPlayed: ${hasPlayed}, status: ${state.player.state?.status}`);
+        if (stderrBuf) console.error('[TTS]   ffmpeg stderr:', stderrBuf.slice(0, 300));
+        state.player.off('stateChange', stateChangeHandler);
+        finish(new Error('TTS playback timeout'));
+      }
+    }, 15_000);
   });
 }
 
