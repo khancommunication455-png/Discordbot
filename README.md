@@ -11,7 +11,7 @@ Combines music, moderation, ticket system, carry management, AH flipping tools, 
 | Command | Description |
 |---|---|
 | `/link <ign>` | Link your Minecraft account to Discord |
-| `/profile [ign]` | View full SkyBlock profile (skills, catacombs, networth) |
+| `/profile [ign]` | View full SkyBlock profile (skills, catacombs, networth) 
 | `/auction [ign]` | See active AH listings for a player |
 | `/bazaar <item>` | Check Bazaar buy/sell prices & spread |
 | `!ah <question>` | Ask the AI-powered AH ChatBot (Groq/Llama 3.3) |
