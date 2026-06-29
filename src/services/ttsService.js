@@ -12,6 +12,7 @@ import {
   AudioPlayerStatus, VoiceConnectionStatus, StreamType,
   NoSubscriberBehavior, entersState,
 } from '@discordjs/voice';
+import prism from 'prism-media';
 import { spawn, execSync } from 'child_process';
 import { existsSync } from 'fs';
 import https from 'https';
@@ -111,7 +112,7 @@ async function buildConnection(guildId, voiceChannelId, adapterCreator) {
   return connection;
 }
 
-// ── Play MP3 buffer (OggOpus passthrough — NO native encoder) ──
+// ── Play MP3 buffer (prism-media FFmpeg transcoder — same as original v1) ──
 function playMP3(state, mp3Buffer) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -119,35 +120,47 @@ function playMP3(state, mp3Buffer) {
 
     console.log(`[TTS] playMP3: ${mp3Buffer.length} bytes`);
 
-    // Spawn ffmpeg to decode MP3 → raw PCM 48k stereo
-    // @discordjs/voice encodes PCM → opus using @discordjs/opus
-    const ffmpegProc = spawn(FFMPEG, [
-      '-i', 'pipe:0', '-analyzeduration', '0', '-loglevel', 'error',
-      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    let pcmBytes = 0, stderrBuf = '';
-    ffmpegProc.stdout.on('data', (chunk) => { pcmBytes += chunk.length; if (pcmBytes === chunk.length) console.log('[TTS] First PCM chunk ✅'); });
-    ffmpegProc.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
-    ffmpegProc.on('error', (err) => { console.error('[TTS] ffmpeg error:', err.message); finish(err); });
-    ffmpegProc.on('close', (code) => {
-      if (code !== 0 && code !== null) { console.error(`[TTS] ffmpeg exited ${code}: ${stderrBuf.slice(0, 300)}`); finish(new Error(`ffmpeg ${code}`)); return; }
-      console.log(`[TTS] ffmpeg done: ${pcmBytes} bytes PCM`);
+    // Use prism-media's FFmpeg transcoder (same as original v1 bot that worked)
+    // This is a Duplex stream: write MP3 to stdin, read PCM from stdout
+    const transcoder = new prism.FFmpeg({
+      args: [
+        '-analyzeduration', '0',
+        '-loglevel', 'error',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+      ],
     });
 
-    try { ffmpegProc.stdin.write(mp3Buffer); ffmpegProc.stdin.end(); console.log('[TTS] MP3 written ✅'); }
-    catch (e) { console.error('[TTS] stdin failed:', e.message); finish(e); return; }
+    transcoder.on('error', (err) => {
+      console.error('[TTS] Transcoder error:', err.message);
+      finish(err);
+    });
 
-    // StreamType.Raw = raw PCM, @discordjs/opus encodes to opus
-    const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw, inlineVolume: false });
+    // Feed MP3 buffer into the transcoder
+    try {
+      transcoder.write(mp3Buffer);
+      transcoder.end();
+      console.log('[TTS] MP3 written to transcoder ✅');
+    } catch (e) {
+      console.error('[TTS] Transcoder write failed:', e.message);
+      finish(e);
+      return;
+    }
 
-    // Track player state changes using the CORRECT event: 'stateChange'
+    // Create audio resource — StreamType.Raw, inlineVolume: false
+    const resource = createAudioResource(transcoder, {
+      inputType: StreamType.Raw,
+      inlineVolume: false,
+    });
+
+    // Track player state using 'stateChange' event
     let hasPlayed = false;
     const stateChangeHandler = (oldState, newState) => {
       console.log(`[TTS] Player: ${oldState.status} → ${newState.status}`);
       if (newState.status === AudioPlayerStatus.Playing) {
         hasPlayed = true;
-        console.log('[TTS] PLAYING ✅ (audio audible in VC)');
+        console.log('[TTS] PLAYING ✅ (audio should be audible)');
       }
       if (newState.status === AudioPlayerStatus.Idle && hasPlayed) {
         console.log('[TTS] Playback complete');
@@ -165,16 +178,16 @@ function playMP3(state, mp3Buffer) {
 
     try {
       state.player.play(resource);
-      console.log('[TTS] player.play() (Raw PCM → @discordjs/opus)');
+      console.log('[TTS] player.play() (prism-media transcoder)');
     } catch (e) {
       console.error('[TTS] play() threw:', e.message);
       finish(e);
     }
 
+    // Safety timeout
     setTimeout(() => {
       if (!settled) {
-        console.error(`[TTS] TIMEOUT: pcm=${pcmBytes}B, hasPlayed=${hasPlayed}, status=${state.player.state?.status}`);
-        if (stderrBuf) console.error('[TTS] ffmpeg stderr:', stderrBuf.slice(0, 300));
+        console.error(`[TTS] TIMEOUT: hasPlayed=${hasPlayed}, status=${state.player.state?.status}`);
         state.player.off('stateChange', stateChangeHandler);
         finish(new Error('TTS timeout'));
       }
@@ -273,4 +286,4 @@ export function getAllTTSStates() { return [...ttsState.values()].map(s => ({ gu
 
 // ── Button handler for Copy AH ID (called by interactionCreate) ──
 export async function handleButton(interaction, client) { return false; }
-      
+                                                                                                
