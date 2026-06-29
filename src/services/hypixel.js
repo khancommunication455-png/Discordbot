@@ -12,10 +12,21 @@
  */
 import axios from 'axios';
 
-const UA = 'SkyBot-v2/2.0 (Discord; +https://github.com/skybot)';
-const TIMEOUT = 12_000;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'identity',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-site',
+};
+const TIMEOUT = 15_000;
 
-const HYPIXEL    = axios.create({ baseURL: 'https://api.hypixel.net/',          timeout: TIMEOUT, headers: { 'User-Agent': UA } });
+const HYPIXEL    = axios.create({ baseURL: 'https://api.hypixel.net/',          timeout: TIMEOUT, headers: BROWSER_HEADERS });
 const MOJANG     = axios.create({ baseURL: 'https://api.mojang.com/',           timeout: TIMEOUT, headers: { 'User-Agent': UA } });
 const ASHCON     = axios.create({ baseURL: 'https://api.ashcon.app/mojang/v2/', timeout: TIMEOUT, headers: { 'User-Agent': UA } });
 const SLOTHPIXEL = axios.create({ baseURL: 'https://api.slothpixel.me/api/',    timeout: 15_000,  headers: { 'User-Agent': UA } });
@@ -355,4 +366,5 @@ export function estimateNetworth(profile, uuid) {
   const member = profile?.members?.[uuid];
   if (!member) return 0;
   return (member.currencies?.coin_purse ?? 0) + (profile.banking?.balance ?? 0);
-}
+                              }
+                
