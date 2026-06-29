@@ -88,22 +88,35 @@ async function synthesize(text) {
   throw new Error('All TTS providers failed');
 }
 
-// ── Build voice connection (retry Ready up to 3 times) ──
+// ── Build voice connection (retry Ready, fall back to Signalling) ──
 async function buildConnection(guildId, voiceChannelId, adapterCreator) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     const connection = joinVoiceChannel({ channelId: voiceChannelId, guildId, adapterCreator, selfDeaf: false, selfMute: false });
+    
+    // Try Ready first (includes UDP) — 15s timeout
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
       console.log(`[TTS] Ready ✅ (attempt ${attempt}, UDP established)`);
       await new Promise(r => setTimeout(r, 2000));
       return connection;
     } catch {
-      console.warn(`[TTS] Ready timed out (attempt ${attempt}/3)`);
+      console.warn(`[TTS] Ready timed out (attempt ${attempt}/2)`);
+    }
+    
+    // Ready failed — try Signalling (WebSocket only, no UDP needed)
+    try {
+      await entersState(connection, VoiceConnectionStatus.Signalling, 10_000);
+      console.log(`[TTS] Signalling reached (attempt ${attempt}, no UDP — using fallback)`);
+      // Extra long grace sleep for UDP to negotiate in background
+      await new Promise(r => setTimeout(r, 5000));
+      return connection;
+    } catch {
+      console.warn(`[TTS] Signalling also failed (attempt ${attempt}/2)`);
       try { connection.destroy(); } catch {}
-      if (attempt < 3) { console.log('[TTS] Retrying in 3s...'); await new Promise(r => setTimeout(r, 3000)); }
+      if (attempt < 2) { console.log('[TTS] Retrying...'); await new Promise(r => setTimeout(r, 3000)); }
     }
   }
-  throw new Error('Voice connection failed after 3 attempts — check bot Connect/Speak permissions');
+  throw new Error('Voice connection failed after 2 attempts — check bot has Connect + Speak permissions in the voice channel');
 }
 
 // ── Play MP3 buffer (OggOpus passthrough — NO native encoder) ──
@@ -159,13 +172,22 @@ async function processQueue(guildId) {
   const state = ttsState.get(guildId);
   if (!state || state.active || !state.queue.length) return;
 
-  // Verify Ready before playing
+  // Verify connection is active before playing (Ready OR Signalling)
   if (state.connection) {
     const cs = state.connection.state?.status;
-    if (cs !== VoiceConnectionStatus.Ready) {
-      console.warn(`[TTS] Connection not Ready (${cs}), waiting...`);
-      try { await entersState(state.connection, VoiceConnectionStatus.Ready, 15_000); console.log('[TTS] Ready ✅'); }
-      catch { console.error('[TTS] Not Ready after 15s — skipping'); state.active = false; return; }
+    if (cs !== VoiceConnectionStatus.Ready && cs !== VoiceConnectionStatus.Signalling) {
+      console.warn(`[TTS] Connection not active (${cs}), waiting...`);
+      try {
+        await Promise.race([
+          entersState(state.connection, VoiceConnectionStatus.Ready, 15_000),
+          entersState(state.connection, VoiceConnectionStatus.Signalling, 15_000),
+        ]);
+        console.log('[TTS] Connection active ✅');
+      } catch {
+        console.error('[TTS] Connection not active after 15s — skipping');
+        state.active = false;
+        return;
+      }
     }
   }
 
