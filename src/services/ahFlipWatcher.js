@@ -1,21 +1,18 @@
 /**
- * ahFlipWatcher.js — SkyBot v2 AH Flip Tracker FIXED + UPGRADED
+ * ahFlipWatcher.js — SkyBot v2 AH Flip Tracker FIXED
  *
  * FIXES:
- * 1. Flips now appear on FIRST scan — uses Moulberry lowestBIN as instant price baseline
- * 2. No longer waits for minSamples to accumulate (uses external price data immediately)
- * 3. Coflnet average price used as market reference when available (more accurate than EWMA)
- * 4. Channel posting was broken: now validates channel ID on startup and logs clearly
- * 5. seenAuctions TTL reduced to 5min so re-listed items are caught faster
- *
- * ACCURACY UPGRADES vs original:
- * - Moulberry lowestBIN = current lowest BIN price = real market floor (better than EWMA)
- * - Coflnet avg price = 7-day average = better for margin calculation
- * - Profit now calculated as: moulberryPrice - currentListingPrice
- * - Items below current market floor by X% are flagged as flips
- * - Combines internal EWMA with external APIs for triple-source accuracy
+ * 1. Removed dead external price APIs (moulberry.codes = Cloudflare 525,
+ *    api.skyhelper.net = does not resolve). Pricing now comes entirely from
+ *    the bot's own EWMA/median, built from the 10,000-auction scans already
+ *    running every cycle — this data was always more current than the dead
+ *    third-party mirrors anyway.
+ * 2. minSamples lowered from 5 → 3 by default, so flips surface within the
+ *    first 2-3 scan cycles (~60-90s) instead of waiting indefinitely.
+ * 3. Channel posting validated on startup with clear log output.
+ * 4. seenAuctions TTL reduced to 5min so re-listed items are caught faster.
  */
-import { getAllAuctions, parseItemAttributes, getMoulberryPrices, getCoflnetPrice } from './hypixel.js';
+import { getAllAuctions, parseItemAttributes } from './hypixel.js';
 import * as priceHistory from './priceHistory.js';
 import { getDb, saveDb } from '../utils/db.js';
 import { C, formatCoins } from '../utils/embeds.js';
@@ -37,7 +34,7 @@ function cfg() {
   };
 }
 
-const SEEN_TTL_MS        = 5 * 60 * 1000;    // 5 min TTL (faster than original 10min)
+const SEEN_TTL_MS        = 5 * 60 * 1000;
 const SEEN_CLEANUP_EVERY = 3 * 60 * 1000;
 const PERSIST_EVERY      = 5;
 const RATE_LIMIT_BACKOFF = 60 * 1000;
@@ -62,22 +59,11 @@ const state = {
   lastSeenCleanup: 0,
   nextScanAllowedAt: 0,
   statsOnlyMode: false,
-  moulberryPrices: {},         // ← NEW: cached Moulberry prices
-  moulberryLoadedAt: 0,
 };
 
 export function buildSignature(attrs) {
   const petLevelBucket = attrs.isPet ? Math.floor(attrs.petLevel / 10) * 10 : 0;
   return [attrs.name, attrs.tier, attrs.isPet ? '1' : '0', petLevelBucket, attrs.stars, attrs.isRecombobulated ? '1' : '0'].join('|');
-}
-
-// ── Normalize item name for Moulberry key lookup ──
-function toMoulberryKey(attrs) {
-  if (attrs.isPet) {
-    const petLvlBucket = attrs.petLevel >= 100 ? 100 : (attrs.petLevel >= 1 ? 1 : 0);
-    return `${attrs.name.toUpperCase().replace(/\s+/g, '_')};${petLvlBucket}`;
-  }
-  return attrs.itemId || attrs.name.toUpperCase().replace(/\s+/g, '_');
 }
 
 // ── Core scan ──
@@ -93,17 +79,6 @@ async function runScan() {
   const C = cfg();
   state.running = true;
   const t0 = Date.now();
-
-  // ── Load Moulberry prices on first scan or if stale ──
-  if (!state.moulberryLoadedAt || Date.now() - state.moulberryLoadedAt > 5 * 60 * 1000) {
-    try {
-      state.moulberryPrices = await getMoulberryPrices();
-      state.moulberryLoadedAt = Date.now();
-      console.log(`[AHFlip] Moulberry prices loaded: ${Object.keys(state.moulberryPrices).length} items`);
-    } catch (e) {
-      console.warn('[AHFlip] Moulberry load failed:', e.message);
-    }
-  }
 
   // ── Fetch auctions ──
   let auctions = [];
@@ -140,29 +115,14 @@ async function runScan() {
 
     const listPrice = a.starting_bid;
 
-    // ── Get market price from 3 sources, best one wins ──
-    let marketPrice = null;
-    let priceSource = 'none';
-
-    // Source 1: Moulberry lowest BIN (most accurate — real-time market floor)
-    const moulKey = toMoulberryKey(attrs);
-    const moulPrice = state.moulberryPrices[moulKey] || state.moulberryPrices[attrs.name.toUpperCase().replace(/\s+/g, '_')];
-    if (moulPrice && moulPrice > listPrice) {
-      marketPrice = moulPrice;
-      priceSource = 'moulberry';
-    }
-
-    // Source 2: Internal EWMA price history (if we have enough samples)
+    // ── Market price comes from the bot's own EWMA/median history ──
     const market = priceHistory.getMarketPrice(sig);
-    if (market && market.count >= C.minSamples && market.ewma > listPrice) {
-      // If both sources agree, use average; if only EWMA, use that
-      marketPrice = marketPrice ? (marketPrice + market.ewma) / 2 : market.ewma;
-      priceSource = marketPrice ? 'combined' : 'ewma';
-    }
+    if (!market || market.count < C.minSamples) continue;
 
-    // If no price found at all, skip
+    const marketPrice = market.ewma;
     if (!marketPrice || marketPrice <= listPrice) continue;
 
+    const priceSource = 'ewma';
     const marginPct = (1 - listPrice / marketPrice) * 100;
     const profit = marketPrice - listPrice;
 
@@ -171,15 +131,14 @@ async function runScan() {
     if (profit < C.minProfit) continue;
     if (attrs.demandScore < C.minDemand) continue;
 
-    // Confidence: higher when multiple price sources agree
-    const sampleCount = market?.count ?? 0;
-    const volumeScore = Math.min(100, sampleCount + (priceSource === 'moulberry' ? 50 : 0));
+    // Confidence: higher with more samples, higher demand, and bigger margin
+    const sampleCount = market.count;
+    const volumeScore = Math.min(100, sampleCount * 4);
     const confidenceScore = Math.min(
       100,
       0.35 * volumeScore +
       0.35 * attrs.demandScore +
-      0.3 * Math.min(100, marginPct * 2) +
-      (priceSource === 'combined' ? 15 : 0),
+      0.3 * Math.min(100, marginPct * 2),
     );
 
     flipsThisCycle.push({
@@ -277,35 +236,33 @@ function persistStats() {
 function buildFlipEmbed(f) {
   const tierColors = { MYTHIC: 0xFF55FF, LEGENDARY: 0xFFAA00, EPIC: 0xAA00AA, RARE: 0x5555FF, UNCOMMON: 0x55FF55, COMMON: 0xFFFFFF };
   const color = tierColors[f.tier] ?? 0x00D4AA;
-  const priceTag = f.priceSource === 'moulberry' ? '📊 Moulberry' : f.priceSource === 'combined' ? '📊 Combined' : '📈 EWMA';
 
   return new EmbedBuilder()
     .setColor(color)
     .setTitle(`💰 ${f.itemName}`)
     .addFields(
       { name: '🏷️ Buy Now', value: formatCoins(f.buyPrice), inline: true },
-      { name: `${priceTag} Market`, value: formatCoins(f.ewma), inline: true },
+      { name: '📈 Market (EWMA)', value: formatCoins(f.ewma), inline: true },
       { name: '💵 Profit', value: `**+${formatCoins(f.profit)}**`, inline: true },
       { name: '📈 Margin', value: `${f.marginPct.toFixed(1)}%`, inline: true },
       { name: '🎯 Tier', value: f.tier || 'Unknown', inline: true },
       { name: '⭐ Confidence', value: `${Math.round(f.confidenceScore)}/100`, inline: true },
       { name: '📋 Command', value: `\`/viewauction ${f.uuid}\``, inline: false },
     )
-    .setFooter({ text: `SkyBot v2 AH Flipper • ${priceTag}` })
+    .setFooter({ text: 'SkyBot v2 AH Flipper' })
     .setTimestamp();
 }
 
 function buildBatchEmbed(flips) {
-  const lines = flips.slice(0, 8).map((f, i) => {
-    const srcIcon = f.priceSource === 'moulberry' ? '📊' : '📈';
-    return `\`${i + 1}.\` **${f.itemName}** ${srcIcon}\n` +
-      `   Buy: ${formatCoins(f.buyPrice)} → Profit: **+${formatCoins(f.profit)}** (${f.marginPct.toFixed(0)}%)`;
-  });
+  const lines = flips.slice(0, 8).map((f, i) =>
+    `\`${i + 1}.\` **${f.itemName}**\n` +
+    `   Buy: ${formatCoins(f.buyPrice)} → Profit: **+${formatCoins(f.profit)}** (${f.marginPct.toFixed(0)}%)`
+  );
   return new EmbedBuilder()
     .setColor(0x00D4AA)
     .setTitle(`🔥 ${flips.length} Flips Found!`)
     .setDescription(lines.join('\n\n'))
-    .setFooter({ text: 'SkyBot v2 AH Flipper • Moulberry + EWMA pricing' })
+    .setFooter({ text: 'SkyBot v2 AH Flipper • EWMA pricing' })
     .setTimestamp();
 }
 
@@ -432,12 +389,12 @@ export async function postTestFlip() {
     .setDescription('The flip channel is correctly configured. Real flips will appear here automatically.')
     .addFields(
       { name: 'Buy Price', value: '1,000,000 coins', inline: true },
-      { name: 'Moulberry Market', value: '2,000,000 coins', inline: true },
+      { name: 'EWMA Market', value: '2,000,000 coins', inline: true },
       { name: 'Profit', value: '**+1,000,000**', inline: true },
       { name: 'Margin', value: '50.0%', inline: true },
       { name: 'Confidence', value: '75/100', inline: true },
-      { name: 'Price Source', value: '📊 Moulberry', inline: true },
-    ).setFooter({ text: 'SkyBot v2 AH Flipper • Moulberry + EWMA Pricing' }).setTimestamp();
+      { name: 'Price Source', value: '📈 EWMA', inline: true },
+    ).setFooter({ text: 'SkyBot v2 AH Flipper • EWMA Pricing' }).setTimestamp();
 
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
   await channel.send({ content: `${ping}🧪 **Test flip — channel verified**`, embeds: [testEmbed] });
@@ -455,14 +412,14 @@ export async function postWelcomeMessage(client) {
 
   const welcomeEmbed = new EmbedBuilder()
     .setColor(0x00D4AA).setTitle('🚀 SkyBot v2 AH Flipper — Online!')
-    .setDescription('Scanning the Hypixel Auction House. Flips powered by **Moulberry lowestBIN** + **EWMA price history** — should appear within seconds!')
+    .setDescription('Scanning the Hypixel Auction House. Flips powered by self-built **EWMA price history** — should appear within 1-3 scan cycles as data builds up.')
     .addFields(
       { name: '📊 Scan Interval', value: `Every **${C.intervalSec}s**`, inline: true },
       { name: '📄 Pages/Scan', value: `${C.maxPages} pages`, inline: true },
       { name: '💰 Min Profit', value: formatCoins(C.minProfit), inline: true },
       { name: '📉 Min Margin', value: `${C.minMarginPct}%`, inline: true },
-      { name: '⚡ Price Source', value: 'Moulberry + EWMA + Coflnet', inline: true },
-      { name: '🎯 First Flip ETA', value: '~10-30 seconds after start', inline: true },
+      { name: '⚡ Price Source', value: 'Self-built EWMA', inline: true },
+      { name: '🎯 First Flip ETA', value: `~${C.intervalSec * 2}-${C.intervalSec * 3}s after start`, inline: true },
     ).setFooter({ text: 'SkyBot v2 • Railway Edition • AH Flipper' }).setTimestamp();
 
   const ping = C.premiumRoleId ? `<@&${C.premiumRoleId}> ` : '';
@@ -489,7 +446,7 @@ export function getFlipWatcherStats() {
     recentFlips: state.recentFlips.slice(0, RECENT_FLIPS_MAX),
     topFlips: state.topFlips.slice(0, 10),
     seenAuctionsSize: state.seenAuctions.size,
-    moulberryItemsLoaded: Object.keys(state.moulberryPrices).length,
+    pricingMethod: 'self-built-ewma',
     statsOnlyMode: state.statsOnlyMode,
     postingToDiscord: shouldPostFlipsToDiscord(),
     config: {

@@ -227,8 +227,53 @@ function playMP3(state, mp3Buffer) {
   });
 }
 
+// ── Permission check BEFORE attempting to join ──
+// This is the #1 silent-failure cause: bot has Connect but not Speak (or vice
+// versa). Discord lets the bot join the channel either way — no error is
+// thrown — but if Speak is missing, Discord server-side mutes the bot's
+// outgoing audio. The bot looks connected, even shows in the channel, but
+// every packet it sends is dropped before reaching listeners.
+function checkVoicePermissions(guild, voiceChannelId) {
+  const channel = guild.channels.cache.get(voiceChannelId);
+  if (!channel) {
+    throw new Error(`Voice channel ${voiceChannelId} not found in this server.`);
+  }
+  const me = guild.members.me;
+  if (!me) {
+    throw new Error('Could not resolve bot member in this guild — try kicking and re-inviting.');
+  }
+  const perms = channel.permissionsFor(me);
+  const missing = [];
+  if (!perms.has('Connect')) missing.push('Connect');
+  if (!perms.has('Speak')) missing.push('Speak');
+  if (!perms.has('ViewChannel')) missing.push('View Channel');
+
+  if (missing.length) {
+    console.error(`[TTS] ❌ PERMISSION CHECK FAILED for #${channel.name}: missing [${missing.join(', ')}]`);
+    throw new Error(
+      `Missing voice permission(s) in **${channel.name}**: **${missing.join(', ')}**.\n` +
+      `Discord allows joining without Speak — the bot connects silently but audio never plays. ` +
+      `Fix: Server Settings → Roles → grant the bot's role Connect + Speak + View Channel ` +
+      `(or set channel-specific permission overrides on ${channel.name}).`
+    );
+  }
+
+  // Check for channel user limit blocking the bot
+  if (channel.userLimit > 0 && channel.members.size >= channel.userLimit && !perms.has('MoveMembers')) {
+    console.warn(`[TTS] ⚠️ Voice channel ${channel.name} may be full (limit ${channel.userLimit})`);
+  }
+
+  console.log(`[TTS] ✅ Permission check passed for #${channel.name} (Connect, Speak, ViewChannel all granted)`);
+  return true;
+}
+
 // ── Build voice connection (waits for Ready, not just Signalling) ──
-async function buildConnection(guildId, voiceChannelId, adapterCreator) {
+async function buildConnection(guildId, voiceChannelId, adapterCreator, guild = null) {
+  // Run permission check first if we have the guild object
+  if (guild) {
+    checkVoicePermissions(guild, voiceChannelId);
+  }
+
   const connection = joinVoiceChannel({
     channelId: voiceChannelId,
     guildId,
@@ -237,26 +282,50 @@ async function buildConnection(guildId, voiceChannelId, adapterCreator) {
     selfMute: false,
   });
 
+  // Log every state transition for full visibility in Railway logs
+  connection.on('stateChange', (oldState, newState) => {
+    console.log(`[TTS] Connection state: ${oldState.status} → ${newState.status}`);
+    if (newState.status === VoiceConnectionStatus.Disconnected) {
+      console.warn('[TTS] ⚠️ Connection disconnected — reason:', newState.reason ?? 'unknown');
+    }
+  });
+  connection.on('error', (err) => {
+    console.error('[TTS] ❌ Connection error event:', err.message);
+  });
+
   // Wait for Ready (full UDP + WebSocket established)
-  // Railway DOES support UDP — the issue was stopping at Signalling
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-    console.log('[TTS] Voice connection Ready ✅');
+    console.log('[TTS] ✅ Voice connection Ready (UDP + WebSocket both confirmed)');
     return connection;
   } catch {
-    console.warn('[TTS] Did not reach Ready — trying Signalling as fallback...');
+    const status = connection.state?.status;
+    console.warn(`[TTS] ⚠️ Did not reach Ready within 30s (stuck at: ${status}) — trying Signalling fallback...`);
   }
 
   // Fallback: wait for Signalling then sleep (old approach)
   try {
     await entersState(connection, VoiceConnectionStatus.Signalling, 15_000);
-    console.log('[TTS] Signalling reached — sleeping 4s for UDP negotiation...');
+    console.log('[TTS] Signalling reached (WebSocket only — UDP not yet confirmed) — sleeping 4s...');
     await new Promise(r => setTimeout(r, 4000));
-    console.log('[TTS] Post-sleep connection ready ✅');
+    const finalStatus = connection.state?.status;
+    console.log(`[TTS] Post-sleep status: ${finalStatus}`);
+    if (finalStatus !== VoiceConnectionStatus.Ready) {
+      console.warn(`[TTS] ⚠️ WARNING: Connection never reached Ready (stuck at ${finalStatus}). ` +
+        `Audio MAY be silent even though no error is thrown. This usually means Railway's UDP egress ` +
+        `is being blocked/throttled for voice traffic specifically — TCP (signalling) works, UDP (audio) doesn't.`);
+    }
     return connection;
   } catch {
+    const status = connection.state?.status;
     try { connection.destroy(); } catch {}
-    throw new Error('Could not connect to Discord voice. Check bot has Connect + Speak permissions.');
+    throw new Error(
+      `Could not establish voice connection (stuck at "${status}" state). ` +
+      `This is NOT a permissions issue (those are checked separately) — ` +
+      `this means Discord's voice gateway never responded. Possible causes: ` +
+      `(1) Railway region has voice gateway issues, (2) bot token/intents misconfigured, ` +
+      `(3) temporary Discord outage. Try /voicecheck for a full diagnostic.`
+    );
   }
 }
 
@@ -272,7 +341,7 @@ async function processQueue(guildId) {
     if (!alive) {
       console.warn(`[TTS] Connection dead (${cs}) — attempting reconnect...`);
       try {
-        const conn = await buildConnection(guildId, state.voiceChannelId, state.adapterCreator);
+        const conn = await buildConnection(guildId, state.voiceChannelId, state.adapterCreator, state.guildRef);
         state.connection = conn;
         conn.subscribe(state.player);
         console.log('[TTS] Reconnected ✅');
@@ -334,7 +403,7 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
     ttsState.delete(guild.id);
   }
 
-  const connection = await buildConnection(guild.id, voiceChannelId, guild.voiceAdapterCreator);
+  const connection = await buildConnection(guild.id, voiceChannelId, guild.voiceAdapterCreator, guild);
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
   connection.subscribe(player);
 
@@ -342,6 +411,7 @@ export async function setupTTS(guild, voiceChannelId, textChannelId, aiMode = fa
     player, connection, queue: [], active: false,
     textChannelId, voiceChannelId,
     adapterCreator: guild.voiceAdapterCreator,
+    guildRef: guild, // kept for reconnect permission re-checks
     connectionDead: false, aiMode, aiHistory: [], client,
   };
   ttsState.set(guild.id, state);
@@ -410,4 +480,90 @@ export function getAllTTSStates() {
     queue: s.queue, active: s.active, connectionDead: s.connectionDead,
   }));
 }
-export async function handleButton(interaction, client) { return false; }
+export { checkVoicePermissions };
+
+/**
+ * Full end-to-end diagnostic — runs every step of the TTS pipeline in
+ * isolation and reports exactly where (if anywhere) it fails. Used by
+ * /voicecheck. Does NOT join voice permanently — cleans up after itself.
+ *
+ * @returns {Promise<{steps: Array<{name: string, ok: boolean, detail: string}>, overallOk: boolean}>}
+ */
+export async function runVoiceDiagnostic(guild, voiceChannelId) {
+  const steps = [];
+  const add = (name, ok, detail) => steps.push({ name, ok, detail });
+
+  // Step 1: Permission check
+  try {
+    checkVoicePermissions(guild, voiceChannelId);
+    add('Permissions (Connect/Speak/View)', true, 'Bot has all required permissions in this channel.');
+  } catch (e) {
+    add('Permissions (Connect/Speak/View)', false, e.message);
+    return { steps, overallOk: false }; // no point continuing if perms fail
+  }
+
+  // Step 2: FFmpeg binary check
+  try {
+    execSync(`${FFMPEG} -version`, { stdio: 'pipe', timeout: 5000 });
+    add('FFmpeg binary', true, `Found and executable at: ${FFMPEG}`);
+  } catch (e) {
+    add('FFmpeg binary', false, `FFmpeg not found or not executable at "${FFMPEG}". Check nixpacks.toml includes ffmpeg-headless.`);
+  }
+
+  // Step 3: TTS provider reachability (StreamElements / Google)
+  let mp3Test = null;
+  try {
+    mp3Test = await synthesize('voice check test');
+    add('TTS audio generation', true, `Got ${mp3Test.length} bytes of audio from provider.`);
+  } catch (e) {
+    add('TTS audio generation', false, `All TTS providers failed: ${e.message}`);
+  }
+
+  // Step 4: Voice connection (real join attempt, reaches Ready or times out)
+  let connection = null;
+  let reachedReady = false;
+  try {
+    connection = joinVoiceChannel({
+      channelId: voiceChannelId,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+      reachedReady = true;
+      add('Voice connection (UDP+WebSocket Ready)', true, 'Connection reached full Ready state — UDP voice channel established.');
+    } catch {
+      const status = connection.state?.status;
+      add('Voice connection (UDP+WebSocket Ready)', false,
+        `Stuck at "${status}" after 15s. If this repeatedly fails, Railway's UDP egress for voice ` +
+        `traffic may be blocked/throttled for your project/region — this is a Railway infra issue, ` +
+        `not your code. Signalling (TCP/WebSocket) working but Ready (UDP) not reached means the ` +
+        `voice control channel connects but the actual audio channel does not.`);
+    }
+  } catch (e) {
+    add('Voice connection (UDP+WebSocket Ready)', false, `joinVoiceChannel threw: ${e.message}`);
+  }
+
+  // Step 5: End-to-end playback test (only if we got audio AND reached Ready)
+  if (mp3Test && reachedReady && connection) {
+    try {
+      const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+      connection.subscribe(player);
+      const tempState = { player, connection };
+      await playMP3(tempState, mp3Test);
+      add('End-to-end playback', true, 'Audio played through fully (player reached Playing then Idle). If you still heard nothing, it strongly points to Railway UDP egress being silently dropped server-side.');
+    } catch (e) {
+      add('End-to-end playback', false, `Playback failed: ${e.message}`);
+    }
+  } else {
+    add('End-to-end playback', false, 'Skipped — prior step(s) failed.');
+  }
+
+  // Cleanup
+  try { connection?.destroy?.(); } catch {}
+
+  const overallOk = steps.every(s => s.ok);
+  return { steps, overallOk };
+}

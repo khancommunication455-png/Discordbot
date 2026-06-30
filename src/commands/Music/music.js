@@ -1,12 +1,24 @@
 /**
- * music.js — SkyBot v2 Music Player FIXED
+ * music.js — SkyBot v2 Music Player (SoundCloud + Spotify)
  *
- * FIXES:
- * 1. Voice connection must reach Ready before playback (not just joined)
- * 2. ffmpeg process piped correctly from yt-dlp stream URL
- * 3. yt-dlp uses cookies-from-browser workaround replaced with po-token approach
- * 4. Added proper connection lifecycle management (destroy on stop/disconnect)
- * 5. Player created once and reused — was being recreated and losing subscription
+ * SWITCHED FROM YOUTUBE: yt-dlp on Railway hits YouTube's bot-detection wall
+ * ("Sign in to confirm you're not a bot") on every client spoof — this is an
+ * IP-reputation block on Railway's datacenter IP ranges, not fixable via
+ * yt-dlp tricks.
+ *
+ * NEW SOURCES:
+ * - SoundCloud: direct search + stream via play-dl (no auth, no IP blocks)
+ * - Spotify: play-dl can read track/playlist METADATA (title, artist, duration)
+ *   but Spotify's actual audio is DRM-protected and cannot be streamed without
+ *   a paid Spotify Premium + Connect SDK integration. So Spotify links are
+ *   parsed for title+artist, then that text is searched on SoundCloud and the
+ *   best matching track is played instead. This is the same approach most
+ *   "Spotify support" Discord bots use under the hood.
+ *
+ * Supports:
+ *   /music play query:lofi hip hop          → SoundCloud search
+ *   /music play query:<soundcloud.com/...>  → direct SoundCloud track/url
+ *   /music play query:<open.spotify.com/...>→ Spotify metadata → SoundCloud match
  */
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import {
@@ -14,124 +26,127 @@ import {
   AudioPlayerStatus, StreamType, NoSubscriberBehavior,
   VoiceConnectionStatus, entersState,
 } from '@discordjs/voice';
-import { spawn, execSync } from 'child_process';
-import { existsSync } from 'fs';
+import play from 'play-dl';
 import { getDb, saveDb } from '../../utils/db.js';
 import { C } from '../../utils/embeds.js';
 
 const FOOTER = { text: 'SkyBot v2 • Railway Edition' };
 
-function findBin(name, paths) {
-  for (const p of paths) {
-    try {
-      if (p === name) { execSync(`${p} --version`, { stdio: 'pipe', timeout: 5000 }); return p; }
-      if (existsSync(p)) return p;
-    } catch {}
+// ── play-dl needs a free SoundCloud client ID — fetched once, cached ──
+let scClientReady = false;
+async function ensureSoundCloudClient() {
+  if (scClientReady) return;
+  try {
+    const clientID = await play.getFreeClientID();
+    await play.setToken({ soundcloud: { client_id: clientID } });
+    scClientReady = true;
+    console.log('[Music] SoundCloud client ID acquired ✅');
+  } catch (e) {
+    console.error('[Music] Failed to get SoundCloud client ID:', e.message);
+    throw new Error('Could not initialize SoundCloud. Try again shortly.');
   }
-  return name;
 }
 
-const YTDLP = findBin('yt-dlp', [
-  '/root/.nix-profile/bin/yt-dlp', '/usr/bin/yt-dlp', '/usr/local/bin/yt-dlp', 'yt-dlp',
-]);
-const FFMPEG = findBin('ffmpeg', [
-  process.env.FFMPEG_PATH,
-  '/root/.nix-profile/bin/ffmpeg', '/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg',
-].filter(Boolean));
-console.log(`[Music] yt-dlp: ${YTDLP} | ffmpeg: ${FFMPEG}`);
-
-function spawnCapture(bin, args, timeoutMs = 25000) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) { settled = true; try { proc.kill(); } catch {}; reject(new Error('timeout')); }
-    }, timeoutMs);
-    proc.stdout.on('data', d => stdout += d);
-    proc.stderr.on('data', d => stderr += d);
-    proc.on('error', err => { if (!settled) { settled = true; clearTimeout(timer); reject(err); } });
-    proc.on('close', code => {
-      if (settled) return; settled = true; clearTimeout(timer);
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`${bin} exited ${code}: ${stderr.slice(0, 400)}`));
-    });
-  });
+function formatDuration(sec) {
+  sec = Math.floor(sec || 0);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-// yt-dlp clients to try (in order — tv/web_embedded bypass most blocks)
-const YT_CLIENTS = ['tv', 'web_embedded', 'web_safari', 'android', 'ios', 'web'];
+// ── Detect link type ──
+function isSpotifyUrl(q) { return /open\.spotify\.com\/(track|album|playlist)/i.test(q); }
+function isSoundCloudUrl(q) { return /soundcloud\.com\//i.test(q); }
 
-// Base yt-dlp args — no cookies needed, extractor handles auth
-const BASE_ARGS = [
-  '--no-playlist', '--no-warnings', '--no-progress',
-  '--no-check-certificates',
-  '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-];
+// ── Resolve a query into a playable SoundCloud track ──
+async function resolveTrack(query) {
+  await ensureSoundCloudClient();
 
-async function getVideoInfo(query) {
-  const isUrl = /^https?:\/\//.test(query);
-  const target = isUrl ? query : `ytsearch1:${query}`;
-  for (const client of YT_CLIENTS) {
+  // ── Spotify link: extract metadata, then search SoundCloud for a match ──
+  if (isSpotifyUrl(query)) {
+    let spotifyInfo;
     try {
-      const json = await spawnCapture(YTDLP, [
-        '-J', ...BASE_ARGS,
-        '--extractor-args', `youtube:player_client=${client}`,
-        target,
-      ], 30000);
-      const info = JSON.parse(json);
-      const v = info.entries?.length ? info.entries[0] : info;
-      const dur = parseInt(v.duration, 10) || 0;
-      console.log(`[Music] search via ${client} ✅`);
-      return {
-        url: v.webpage_url || v.url || query,
-        title: v.title || 'Unknown',
-        duration: dur,
-        durationStr: v.duration_string || (dur > 0 ? `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}` : 'LIVE'),
-        thumbnail: v.thumbnail || '',
-        author: v.uploader || v.channel || 'Unknown',
-      };
-    } catch (err) {
-      console.warn(`[Music] search ${client} failed: ${String(err.message || err).slice(0, 100)}`);
+      spotifyInfo = await play.spotify(query);
+    } catch (e) {
+      throw new Error('Could not read that Spotify link. Make sure it\'s a public track/playlist URL.');
     }
-  }
-  throw new Error('YouTube is blocking the bot. Try again later or use a direct URL.');
-}
 
-async function getAudioUrl(videoUrl) {
-  for (const client of YT_CLIENTS) {
-    try {
-      const out = await spawnCapture(YTDLP, [
-        '-f', 'bestaudio[ext=webm]/bestaudio/best',
-        '-g', ...BASE_ARGS,
-        '--extractor-args', `youtube:player_client=${client}`,
-        videoUrl,
-      ], 25000);
-      const url = out.split('\n').map(s => s.trim()).filter(Boolean)[0];
-      if (url) { console.log(`[Music] audio via ${client} ✅`); return url; }
-    } catch (err) {
-      console.warn(`[Music] audio ${client} failed: ${String(err.message || err).slice(0, 100)}`);
+    if (spotifyInfo.type === 'track') {
+      const searchQuery = `${spotifyInfo.name} ${spotifyInfo.artists?.[0]?.name ?? ''}`.trim();
+      console.log(`[Music] Spotify track "${spotifyInfo.name}" → searching SoundCloud: "${searchQuery}"`);
+      return await searchSoundCloud(searchQuery, { spotifyMeta: spotifyInfo });
     }
+
+    if (spotifyInfo.type === 'playlist' || spotifyInfo.type === 'album') {
+      // Return first track of playlist/album as a starting point
+      const tracks = await spotifyInfo.all_tracks?.() ?? spotifyInfo.fetched_tracks?.get(1) ?? [];
+      if (!tracks.length) throw new Error('Spotify playlist/album appears empty or private.');
+      const first = tracks[0];
+      const searchQuery = `${first.name} ${first.artists?.[0]?.name ?? ''}`.trim();
+      console.log(`[Music] Spotify playlist first track "${first.name}" → SoundCloud: "${searchQuery}"`);
+      return await searchSoundCloud(searchQuery, { spotifyMeta: first });
+    }
+
+    throw new Error('Unsupported Spotify link type.');
   }
-  return null;
+
+  // ── Direct SoundCloud URL ──
+  if (isSoundCloudUrl(query)) {
+    let info;
+    try {
+      info = await play.soundcloud(query);
+    } catch (e) {
+      throw new Error('Could not load that SoundCloud link. It may be private or removed.');
+    }
+    if (info.type !== 'track') throw new Error('Only individual SoundCloud tracks are supported (not playlists yet).');
+    return {
+      url: info.url,
+      title: info.name || 'Unknown',
+      duration: info.durationInSec || 0,
+      durationStr: formatDuration(info.durationInSec),
+      thumbnail: info.thumbnail || '',
+      author: info.user?.name || 'Unknown',
+      scTrack: info,
+    };
+  }
+
+  // ── Plain text search → SoundCloud ──
+  return await searchSoundCloud(query);
 }
 
-// Create audio stream from direct URL using ffmpeg
-// Returns the ffmpeg child process — caller uses .stdout as the audio stream
-function createAudioStream(audioUrl) {
-  const ff = spawn(FFMPEG, [
-    '-hide_banner', '-loglevel', 'error',
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', audioUrl,
-    '-vn',
-    '-f', 's16le', '-ar', '48000', '-ac', '2',
-    'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
-  ff.stderr.on('data', d => { const s = d.toString().trim(); if (s) console.warn('[Music] ffmpeg:', s.slice(0, 120)); });
-  ff.on('error', err => console.error('[Music] ffmpeg error:', err.message));
-  return ff;
+async function searchSoundCloud(query, { spotifyMeta } = {}) {
+  let results;
+  try {
+    results = await play.search(query, { source: { soundcloud: 'tracks' }, limit: 5 });
+  } catch (e) {
+    throw new Error(`SoundCloud search failed: ${e.message}`);
+  }
+  if (!results?.length) {
+    throw new Error(spotifyMeta
+      ? `Found the Spotify track "${spotifyMeta.name}" but no matching version exists on SoundCloud.`
+      : 'No results found on SoundCloud for that search.');
+  }
+  const track = results[0];
+  return {
+    url: track.url,
+    title: track.name || (spotifyMeta?.name ?? 'Unknown'),
+    duration: track.durationInSec || 0,
+    durationStr: formatDuration(track.durationInSec),
+    thumbnail: track.thumbnail || '',
+    author: track.user?.name || (spotifyMeta?.artists?.[0]?.name ?? 'Unknown'),
+    scTrack: track,
+    viaSpotify: !!spotifyMeta,
+  };
 }
 
-// Build a stable voice connection that reaches Ready
+// ── Get a playable audio stream for a resolved SoundCloud track ──
+async function getAudioStream(track) {
+  const streamInfo = await play.stream_from_info(track.scTrack, { quality: 1 });
+  // streamInfo.stream is a Readable; streamInfo.type tells discord.js the encoding
+  return streamInfo;
+}
+
+// ── Build a stable voice connection that reaches Ready ──
 async function buildVoiceConnection(voiceChannel, guildId, adapterCreator) {
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
@@ -145,13 +160,12 @@ async function buildVoiceConnection(voiceChannel, guildId, adapterCreator) {
     console.log('[Music] Voice connection Ready ✅');
     return connection;
   } catch {
-    // Fallback: wait for Signalling + sleep
     try {
       await entersState(connection, VoiceConnectionStatus.Signalling, 10_000);
       await new Promise(r => setTimeout(r, 4000));
       console.log('[Music] Voice connection (Signalling+sleep) ✅');
       return connection;
-    } catch (e) {
+    } catch {
       try { connection.destroy(); } catch {}
       throw new Error('Could not join voice channel. Check permissions.');
     }
@@ -166,7 +180,6 @@ function getGuildState(client, guildId) {
     client.musicQueues.set(guildId, {
       queue: [], current: 0, player: null, connection: null,
       playing: false, paused: false, volume: settings.volume, loop: settings.loop,
-      currentFF: null, // track current ffmpeg process for cleanup
     });
   }
   return client.musicQueues.get(guildId);
@@ -196,52 +209,50 @@ async function playNext(client, guildId, textChannel) {
   state.paused = false;
 
   try {
-    textChannel.send({ embeds: [new EmbedBuilder().setColor(C.music ?? 0x1DB954).setTitle('▶️ Now Playing').setDescription(`**${track.title}**\n${track.durationStr} • ${track.author}`).setFooter(FOOTER).setTimestamp()] });
+    textChannel.send({
+      embeds: [new EmbedBuilder()
+        .setColor(C.music ?? 0xFF5500)
+        .setTitle('▶️ Now Playing')
+        .setDescription(`**${track.title}**\n${track.durationStr} • ${track.author}${track.viaSpotify ? '\n*(matched from Spotify via SoundCloud)*' : ''}`)
+        .setFooter(FOOTER).setTimestamp()],
+    });
   } catch {}
 
-  // Ensure voice connection is alive
   if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
     console.warn('[Music] No voice connection — cannot play');
     state.playing = false;
     return;
   }
 
-  // Make sure we're Ready
   try {
     await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
   } catch {
     console.warn('[Music] Connection not Ready before play — continuing anyway');
   }
 
-  // Get audio URL
-  const audioUrl = await getAudioUrl(track.url);
-  if (!audioUrl) {
+  let streamInfo;
+  try {
+    streamInfo = await getAudioStream(track);
+  } catch (e) {
+    console.error('[Music] Stream fetch failed:', e.message);
     try {
-      textChannel.send({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Playback Error').setDescription('Could not get audio URL. YouTube may be blocking.').setFooter(FOOTER).setTimestamp()] });
+      textChannel.send({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Playback Error').setDescription(`Could not stream this track: ${e.message.slice(0, 200)}`).setFooter(FOOTER).setTimestamp()] });
     } catch {}
     state.queue.splice(state.current, 1);
     return playNext(client, guildId, textChannel);
   }
 
-  // Kill previous ffmpeg if any
-  if (state.currentFF) { try { state.currentFF.kill('SIGKILL'); } catch {} state.currentFF = null; }
-
-  const ff = createAudioStream(audioUrl);
-  state.currentFF = ff;
-
-  const resource = createAudioResource(ff.stdout, {
-    inputType: StreamType.Raw,
+  const resource = createAudioResource(streamInfo.stream, {
+    inputType: streamInfo.type, // play-dl tells us the correct StreamType (usually Opus or Arbitrary)
     inlineVolume: false,
   });
 
-  // Create player once, reuse it
   if (!state.player) {
     state.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
     state.connection.subscribe(state.player);
 
     state.player.on(AudioPlayerStatus.Idle, () => {
       const s = getGuildState(client, guildId);
-      if (s.currentFF) { try { s.currentFF.kill('SIGKILL'); } catch {} s.currentFF = null; }
       if (s.loop) {
         playNext(client, guildId, textChannel);
       } else {
@@ -258,25 +269,23 @@ async function playNext(client, guildId, textChannel) {
 
     state.player.on('error', err => {
       console.error('[Music] Player error:', err.message);
-      // Try next track
       const s = getGuildState(client, guildId);
       s.current++;
       if (s.current < s.queue.length) playNext(client, guildId, textChannel);
       else { s.playing = false; s.queue = []; s.current = 0; }
     });
   } else {
-    // Re-subscribe in case connection was recreated
     state.connection.subscribe(state.player);
   }
 
   state.player.play(resource);
-  console.log(`[Music] Playing: ${track.title}`);
+  console.log(`[Music] Playing: ${track.title} (SoundCloud)`);
 }
 
 export default {
   data: new SlashCommandBuilder()
-    .setName('music').setDescription('Music player')
-    .addSubcommand(s => s.setName('play').setDescription('Play a song').addStringOption(o => o.setName('query').setDescription('Song name or URL').setRequired(true)))
+    .setName('music').setDescription('Music player (SoundCloud + Spotify)')
+    .addSubcommand(s => s.setName('play').setDescription('Play a song from SoundCloud or a Spotify link').addStringOption(o => o.setName('query').setDescription('Song name, SoundCloud URL, or Spotify URL').setRequired(true)))
     .addSubcommand(s => s.setName('skip').setDescription('Skip current song'))
     .addSubcommand(s => s.setName('stop').setDescription('Stop and clear queue'))
     .addSubcommand(s => s.setName('queue').setDescription('Show queue'))
@@ -300,19 +309,18 @@ export default {
       if (!voiceChannel) return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Not in Voice').setDescription('Join a voice channel first.').setFooter(FOOTER).setTimestamp()] });
 
       const query = interaction.options.getString('query');
-      await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('🔍 Searching...').setDescription(`Looking up: **${query}**`).setFooter(FOOTER).setTimestamp()] });
+      const sourceLabel = isSpotifyUrl(query) ? 'Spotify' : isSoundCloudUrl(query) ? 'SoundCloud' : 'SoundCloud search';
+      await interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('🔍 Searching...').setDescription(`**${sourceLabel}:** ${query.slice(0, 80)}`).setFooter(FOOTER).setTimestamp()] });
 
       let track;
-      try { track = await getVideoInfo(query); }
+      try { track = await resolveTrack(query); }
       catch (err) { return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Search Failed').setDescription(err.message).setFooter(FOOTER).setTimestamp()] }); }
 
       state.queue.push(track);
 
-      // Build/reuse voice connection
       if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
         try {
           state.connection = await buildVoiceConnection(voiceChannel, guildId, interaction.guild.voiceAdapterCreator);
-          // If player exists, re-subscribe it to the new connection
           if (state.player) state.connection.subscribe(state.player);
         } catch (err) {
           return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Voice Error').setDescription(err.message).setFooter(FOOTER).setTimestamp()] });
@@ -324,7 +332,13 @@ export default {
         playNext(client, guildId, interaction.channel);
       }
 
-      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.success ?? 0x00FF00).setTitle('✅ Added to Queue').setDescription(`**${track.title}**\n${track.durationStr} • ${track.author}\nPosition: ${state.queue.length}`).setFooter(FOOTER).setTimestamp()] });
+      return interaction.editReply({
+        embeds: [new EmbedBuilder()
+          .setColor(C.success ?? 0x00FF00)
+          .setTitle('✅ Added to Queue')
+          .setDescription(`**${track.title}**\n${track.durationStr} • ${track.author}${track.viaSpotify ? '\n*(Spotify → SoundCloud match)*' : ''}\nPosition: ${state.queue.length}`)
+          .setFooter(FOOTER).setTimestamp()],
+      });
     }
 
     if (sub === 'skip') {
@@ -335,7 +349,6 @@ export default {
 
     if (sub === 'stop') {
       state.queue = []; state.current = 0; state.playing = false;
-      try { state.currentFF?.kill('SIGKILL'); state.currentFF = null; } catch {}
       try { state.player?.stop(); } catch {}
       try { state.connection?.destroy(); } catch {}
       state.connection = null; state.player = null;
@@ -345,7 +358,7 @@ export default {
     if (sub === 'queue') {
       if (state.queue.length === 0) return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.info).setTitle('📜 Queue Empty').setFooter(FOOTER).setTimestamp()] });
       const list = state.queue.map((t, i) => `${i === state.current ? '▶️' : `${i + 1}.`} **${t.title}** (${t.durationStr})`).join('\n');
-      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.music ?? 0x1DB954).setTitle('📜 Queue').setDescription(list.slice(0, 4000)).setFooter(FOOTER).setTimestamp()] });
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.music ?? 0xFF5500).setTitle('📜 Queue').setDescription(list.slice(0, 4000)).setFooter(FOOTER).setTimestamp()] });
     }
 
     if (sub === 'pause') {
@@ -375,7 +388,7 @@ export default {
     if (sub === 'nowplaying') {
       if (!state.playing || state.queue.length === 0) return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.error).setTitle('❌ Nothing Playing').setFooter(FOOTER).setTimestamp()] });
       const t = state.queue[state.current];
-      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.music ?? 0x1DB954).setTitle('▶️ Now Playing').setDescription(`**${t.title}**\n${t.durationStr} • ${t.author}`).setFooter(FOOTER).setTimestamp()] });
+      return interaction.editReply({ embeds: [new EmbedBuilder().setColor(C.music ?? 0xFF5500).setTitle('▶️ Now Playing').setDescription(`**${t.title}**\n${t.durationStr} • ${t.author}`).setFooter(FOOTER).setTimestamp()] });
     }
 
     if (sub === 'shuffle') {

@@ -2,10 +2,11 @@
  * hypixel.js — SkyBot v2 Multi-Fallback Hypixel API Wrapper (FIXED)
  *
  * FIXES:
- * 1. Added Moulberry's lowest-BIN API (free, no key) for instant price baseline
- * 2. Added SkyHelper API as additional fallback
- * 3. getAllAuctions now fetches ALL pages (Hypixel AH has ~200+ pages, scanning 10 gives real data)
- * 4. Better error handling and retry logic
+ * 1. Removed dead external price APIs (moulberry.codes returns Cloudflare 525,
+ *    api.skyhelper.net does not resolve) — flip pricing relies entirely on
+ *    self-built EWMA/median from priceHistory.js now (see ahFlipWatcher.js)
+ * 2. getAllAuctions fetches up to maxPages in parallel chunks
+ * 3. Better error handling and retry logic
  */
 import axios from 'axios';
 
@@ -25,10 +26,10 @@ const ASHCON     = axios.create({ baseURL: 'https://api.ashcon.app/mojang/v2/', 
 const SLOTHPIXEL = axios.create({ baseURL: 'https://api.slothpixel.me/api/',    timeout: 15_000,  headers: { 'User-Agent': UA } });
 const SKYCRYPT   = axios.create({ baseURL: 'https://sky.shiiyu.moe/api/v2/',    timeout: 15_000,  headers: { 'User-Agent': UA } });
 
-// Free price APIs (no key needed)
-const MOULBERRY  = axios.create({ baseURL: 'https://moulberry.codes/',          timeout: 10_000,  headers: { 'User-Agent': UA } });
-const SKYHELPER  = axios.create({ baseURL: 'https://api.skyhelper.net/',        timeout: 10_000,  headers: { 'User-Agent': UA } });
-const COFLNET    = axios.create({ baseURL: 'https://sky.coflnet.com/api/',      timeout: 10_000,  headers: { 'User-Agent': UA } });
+// NOTE: moulberry.codes (Cloudflare 525) and api.skyhelper.net (does not resolve)
+// were both dead and have been removed. Flip pricing now comes entirely from
+// the bot's own self-built EWMA/median in priceHistory.js, fed by the
+// 10,000-auction scans already running every cycle — no external price API needed.
 
 function hasKey() { return !!process.env.HYPIXEL_API_KEY; }
 
@@ -166,59 +167,7 @@ export async function getAllAuctions(maxPages = 10) {
   return allAuctions;
 }
 
-// ── Moulberry Lowest BIN (free, no key, instant price reference) ──
-// Returns a Map<itemId, lowestBin> for fast lookup
-let moulberryCache = null;
-let moulberryCacheAt = 0;
-const MOULBERRY_TTL = 5 * 60 * 1000; // 5 minutes
 
-export async function getMoulberryPrices() {
-  if (moulberryCache && Date.now() - moulberryCacheAt < MOULBERRY_TTL) {
-    return moulberryCache;
-  }
-  try {
-    const data = await tryGet(MOULBERRY, 'lowestbin.json');
-    if (data && typeof data === 'object') {
-      moulberryCache = data;
-      moulberryCacheAt = Date.now();
-      console.log(`[Hypixel] Moulberry lowestBIN loaded: ${Object.keys(data).length} items`);
-      return data;
-    }
-  } catch (e) { console.warn('[Hypixel] Moulberry failed:', e.message); }
-
-  // Fallback: try SkyHelper bazaar/item prices
-  try {
-    const data = await tryGet(SKYHELPER, 'skyblock/lowestbins');
-    if (data && typeof data === 'object') {
-      moulberryCache = data;
-      moulberryCacheAt = Date.now();
-      return data;
-    }
-  } catch (e) { console.warn('[Hypixel] SkyHelper lowestbins failed:', e.message); }
-
-  return moulberryCache ?? {};
-}
-
-// ── Get item average price from Coflnet (free analytics API) ──
-// Returns { avg, min, max, volume } or null
-export async function getCoflnetPrice(itemId) {
-  const cacheKey = `cofl_${itemId}`;
-  const cached = getCached(cacheKey);
-  if (cached !== null) return cached;
-
-  try {
-    // Coflnet's /item/price/{itemId}/current returns recent price data
-    const data = await tryGet(COFLNET, `item/price/${encodeURIComponent(itemId)}/current`);
-    if (data?.min !== undefined) {
-      const result = { avg: data.avg ?? data.min, min: data.min, max: data.max ?? data.avg, volume: data.volume ?? 0 };
-      setCached(cacheKey, result, 3 * 60 * 1000); // 3 min cache
-      return result;
-    }
-  } catch {}
-
-  setCached(cacheKey, null, 60_000);
-  return null;
-}
 
 // ── Bazaar ──
 export async function getBazaar() {
